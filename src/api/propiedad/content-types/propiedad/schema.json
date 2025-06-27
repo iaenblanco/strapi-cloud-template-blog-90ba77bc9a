@@ -18,14 +18,88 @@
       "type": "uid",
       "targetField": "Titulo"
     },
+    "Objetivo": {
+      "type": "enumeration",
+      "enum": [
+        "Venta",
+        "Arriendo"
+      ]
+    },
+    "Tipo": {
+      "type": "enumeration",
+      "enum": [
+        "Casa",
+        "Departamento"
+      ]
+    },
+    "Region": {
+      "type": "string"
+    },
     "Ubicacion": {
       "type": "string"
     },
-    "Descripcion": {
-      "type": "richtext"
+    "Direccion": {
+      "type": "text"
     },
     "Precio": {
       "type": "decimal"
+    },
+    "Precio_CLP": {
+      "type": "integer"
+    },
+    "Gastos_comunes": {
+      "type": "integer"
+    },
+    "Contribuciones": {
+      "type": "integer"
+    },
+    "Dormitorios": {
+      "type": "integer"
+    },
+    "Servicio": {
+      "type": "integer"
+    },
+    "suites": {
+      "type": "integer"
+    },
+    "Banos": {
+      "type": "integer"
+    },
+    "Superficie": {
+      "type": "integer"
+    },
+    "M2utiles": {
+      "type": "integer"
+    },
+    "Walk_in_closet": {
+      "type": "integer"
+    },
+    "Terrazas": {
+      "type": "integer"
+    },
+    "Piso": {
+      "type": "integer"
+    },
+    "Bodega": {
+      "type": "integer"
+    },
+    "Estacionamientos": {
+      "type": "integer"
+    },
+    "ano_construccion": {
+      "type": "integer"
+    },
+    "Orientacion": {
+      "type": "string"
+    },
+    "Publicado": {
+      "type": "boolean"
+    },
+    "Destacado": {
+      "type": "boolean"
+    },
+    "Oportunidades": {
+      "type": "boolean"
     },
     "Imagenes": {
       "type": "media",
@@ -37,22 +111,25 @@
         "audios"
       ]
     },
-    "Dormitorios": {
-      "type": "integer"
+    "Descripcion": {
+      "type": "richtext"
     },
-    "Banos": {
-      "type": "integer"
-    },
-    "Superficie": {
-      "type": "integer"
-    },
-    "Destacado": {
+    "Piscina": {
       "type": "boolean"
     },
-    "Direccion": {
-      "type": "text"
+    "Quincho": {
+      "type": "boolean"
     },
-    "Publicado": {
+    "sala_multiuso": {
+      "type": "boolean"
+    },
+    "Tipo_de_seguridad": {
+      "type": "string"
+    },
+    "Gimnasio": {
+      "type": "boolean"
+    },
+    "Lavanderia": {
       "type": "boolean"
     }
   }

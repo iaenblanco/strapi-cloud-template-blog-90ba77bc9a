@@ -549,7 +549,10 @@ export interface ApiPropiedadPropiedad extends Struct.CollectionTypeSchema {
     draftAndPublish: true;
   };
   attributes: {
+    ano_construccion: Schema.Attribute.Integer;
     Banos: Schema.Attribute.Integer;
+    Bodega: Schema.Attribute.Integer;
+    Contribuciones: Schema.Attribute.Integer;
     createdAt: Schema.Attribute.DateTime;
     createdBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
       Schema.Attribute.Private;
@@ -557,26 +560,46 @@ export interface ApiPropiedadPropiedad extends Struct.CollectionTypeSchema {
     Destacado: Schema.Attribute.Boolean;
     Direccion: Schema.Attribute.Text;
     Dormitorios: Schema.Attribute.Integer;
+    Estacionamientos: Schema.Attribute.Integer;
+    Gastos_comunes: Schema.Attribute.Integer;
+    Gimnasio: Schema.Attribute.Boolean;
     Imagenes: Schema.Attribute.Media<
       'images' | 'files' | 'videos' | 'audios',
       true
     >;
+    Lavanderia: Schema.Attribute.Boolean;
     locale: Schema.Attribute.String & Schema.Attribute.Private;
     localizations: Schema.Attribute.Relation<
       'oneToMany',
       'api::propiedad.propiedad'
     > &
       Schema.Attribute.Private;
+    M2utiles: Schema.Attribute.Integer;
+    Objetivo: Schema.Attribute.Enumeration<['Venta', 'Arriendo']>;
+    Oportunidades: Schema.Attribute.Boolean;
+    Orientacion: Schema.Attribute.String;
+    Piscina: Schema.Attribute.Boolean;
+    Piso: Schema.Attribute.Integer;
     Precio: Schema.Attribute.Decimal;
+    Precio_CLP: Schema.Attribute.Integer;
     Publicado: Schema.Attribute.Boolean;
     publishedAt: Schema.Attribute.DateTime;
+    Quincho: Schema.Attribute.Boolean;
+    Region: Schema.Attribute.String;
+    sala_multiuso: Schema.Attribute.Boolean;
+    Servicio: Schema.Attribute.Integer;
     Slug: Schema.Attribute.UID<'Titulo'>;
+    suites: Schema.Attribute.Integer;
     Superficie: Schema.Attribute.Integer;
+    Terrazas: Schema.Attribute.Integer;
+    Tipo: Schema.Attribute.Enumeration<['Casa', 'Departamento']>;
+    Tipo_de_seguridad: Schema.Attribute.String;
     Titulo: Schema.Attribute.String;
     Ubicacion: Schema.Attribute.String;
     updatedAt: Schema.Attribute.DateTime;
     updatedBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
       Schema.Attribute.Private;
+    Walk_in_closet: Schema.Attribute.Integer;
   };
 }
 
