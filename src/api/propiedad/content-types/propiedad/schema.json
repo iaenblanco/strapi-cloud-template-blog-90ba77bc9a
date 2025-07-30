@@ -41,6 +41,9 @@
     "Direccion": {
       "type": "text"
     },
+    "Comuna": {
+      "type": "string"
+    },
     "Precio": {
       "type": "decimal"
     },

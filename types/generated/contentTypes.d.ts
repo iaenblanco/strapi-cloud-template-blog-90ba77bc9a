@@ -552,6 +552,7 @@ export interface ApiPropiedadPropiedad extends Struct.CollectionTypeSchema {
     ano_construccion: Schema.Attribute.Integer;
     Banos: Schema.Attribute.Integer;
     Bodega: Schema.Attribute.Integer;
+    Comuna: Schema.Attribute.String;
     Contribuciones: Schema.Attribute.Integer;
     createdAt: Schema.Attribute.DateTime;
     createdBy: Schema.Attribute.Relation<'oneToOne', 'admin::user'> &
