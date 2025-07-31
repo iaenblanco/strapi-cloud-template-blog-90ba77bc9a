@@ -29,7 +29,16 @@
       "type": "enumeration",
       "enum": [
         "Casa",
-        "Departamento"
+        "Terreno",
+        "Oficina",
+        "Departamento",
+        "Locales Comerciales",
+        "Sitio",
+        "Bodega",
+        "Industriales",
+        "Estacionamientos",
+        "Parcela",
+        "Otros Inmuebles"
       ]
     },
     "Region": {
