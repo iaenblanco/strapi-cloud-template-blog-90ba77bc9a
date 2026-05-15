@@ -143,6 +143,34 @@
     },
     "Lavanderia": {
       "type": "boolean"
+    },
+    "kiteprop_id": {
+      "type": "biginteger",
+      "unique": true
+    },
+    "kiteprop_code": {
+      "type": "string"
+    },
+    "kiteprop_internal_id": {
+      "type": "string"
+    },
+    "kiteprop_source_id": {
+      "type": "string"
+    },
+    "kiteprop_status": {
+      "type": "string"
+    },
+    "kiteprop_updated_at": {
+      "type": "datetime"
+    },
+    "kiteprop_synced_at": {
+      "type": "datetime"
+    },
+    "kiteprop_imagenes": {
+      "type": "json"
+    },
+    "kiteprop_raw": {
+      "type": "json"
     }
   }
 }

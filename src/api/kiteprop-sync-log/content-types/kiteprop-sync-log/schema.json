@@ -1,0 +1,54 @@
+{
+  "kind": "collectionType",
+  "collectionName": "kiteprop_sync_logs",
+  "info": {
+    "singularName": "kiteprop-sync-log",
+    "pluralName": "kiteprop-sync-logs",
+    "displayName": "KiteProp Sync Log",
+    "description": "Audit trail of every KiteProp sync operation. Append-only."
+  },
+  "options": {
+    "draftAndPublish": false
+  },
+  "pluginOptions": {
+    "content-manager": {
+      "visible": true
+    },
+    "content-type-builder": {
+      "visible": false
+    }
+  },
+  "attributes": {
+    "run_id": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    },
+    "resource": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string"
+    },
+    "kiteprop_id": {
+      "type": "biginteger"
+    },
+    "status": {
+      "type": "string"
+    },
+    "message": {
+      "type": "text"
+    },
+    "error_details": {
+      "type": "json"
+    },
+    "duration_ms": {
+      "type": "integer"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "kind": "singleType",
+  "collectionName": "kiteprop_sync_states",
+  "info": {
+    "singularName": "kiteprop-sync-state",
+    "pluralName": "kiteprop-sync-states",
+    "displayName": "KiteProp Sync State",
+    "description": "Internal cursor + lock for the KiteProp synchronization job. Do not edit manually unless you know what you are doing."
+  },
+  "options": {
+    "draftAndPublish": false
+  },
+  "pluginOptions": {
+    "content-manager": {
+      "visible": true
+    },
+    "content-type-builder": {
+      "visible": false
+    }
+  },
+  "attributes": {
+    "last_activity_id": {
+      "type": "biginteger"
+    },
+    "last_activity_created_at": {
+      "type": "datetime"
+    },
+    "last_max_property_id": {
+      "type": "biginteger"
+    },
+    "last_run_at": {
+      "type": "datetime"
+    },
+    "last_success_at": {
+      "type": "datetime"
+    },
+    "last_error": {
+      "type": "text"
+    },
+    "is_running": {
+      "type": "boolean",
+      "default": false
+    },
+    "lock_acquired_at": {
+      "type": "datetime"
+    },
+    "current_run_id": {
+      "type": "string"
+    }
+  }
+}
