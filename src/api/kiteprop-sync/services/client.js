@@ -16,7 +16,9 @@
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_RETRY_BASE_MS = 500;
+const DEFAULT_REQUEST_DELAY_MS = 2000;
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+let lastRequestStartedAt = 0;
 
 function readEnvNumber(name, fallback) {
   const raw = process.env[name];
@@ -35,6 +37,7 @@ function getConfig() {
     timeoutMs: readEnvNumber('KITEPROP_SYNC_REQUEST_TIMEOUT_MS', DEFAULT_TIMEOUT_MS),
     maxRetries: readEnvNumber('KITEPROP_SYNC_MAX_RETRIES', DEFAULT_MAX_RETRIES),
     retryBaseMs: readEnvNumber('KITEPROP_SYNC_RETRY_BASE_MS', DEFAULT_RETRY_BASE_MS),
+    requestDelayMs: readEnvNumber('KITEPROP_SYNC_REQUEST_DELAY_MS', DEFAULT_REQUEST_DELAY_MS),
   };
 }
 
@@ -104,6 +107,12 @@ async function request({ method, path, query, body, logger = console }) {
   let lastResponse = null;
 
   for (let attempt = 1; attempt <= cfg.maxRetries; attempt += 1) {
+    const elapsedSinceLastRequest = Date.now() - lastRequestStartedAt;
+    if (cfg.requestDelayMs > 0 && elapsedSinceLastRequest < cfg.requestDelayMs) {
+      await sleep(cfg.requestDelayMs - elapsedSinceLastRequest);
+    }
+    lastRequestStartedAt = Date.now();
+
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), cfg.timeoutMs);
     const startedAt = Date.now();
