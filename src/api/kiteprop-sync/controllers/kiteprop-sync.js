@@ -52,6 +52,7 @@ module.exports = {
         },
         config: {
           base_url: process.env.KITEPROP_BASE_URL || null,
+          cron_enabled: String(process.env.CRON_ENABLED || 'false') === 'true',
           sync_enabled: String(process.env.KITEPROP_SYNC_ENABLED || 'false') === 'true',
           dry_run_default: String(process.env.KITEPROP_SYNC_DRY_RUN || 'true') === 'true',
           delete_strategy: process.env.KITEPROP_DELETE_STRATEGY || 'soft',

@@ -29,7 +29,7 @@ const DELTA_CRON = process.env.KITEPROP_SYNC_PROPERTIES_DELTA_CRON || '*/5 * * *
 const SNIFFER_CRON = process.env.KITEPROP_SYNC_PROPERTIES_SNIFFER_CRON || '30 */5 * * * *';
 
 module.exports = {
-  [DELTA_CRON]: {
+  'kiteprop-properties-delta': {
     task: async ({ strapi }) => {
       if (!isSyncEnabled()) {
         strapi.log.debug('[kiteprop-sync][cron] delta skipped: KITEPROP_SYNC_ENABLED is false');
@@ -43,11 +43,11 @@ module.exports = {
       }
     },
     options: {
-      // node-cron timezone is UTC by default; override with KITEPROP_SYNC_TIMEZONE if needed.
+      rule: DELTA_CRON,
       tz: process.env.KITEPROP_SYNC_TIMEZONE || 'UTC',
     },
   },
-  [SNIFFER_CRON]: {
+  'kiteprop-properties-sniffer': {
     task: async ({ strapi }) => {
       if (!isSyncEnabled()) {
         strapi.log.debug('[kiteprop-sync][cron] sniffer skipped: KITEPROP_SYNC_ENABLED is false');
@@ -61,6 +61,7 @@ module.exports = {
       }
     },
     options: {
+      rule: SNIFFER_CRON,
       tz: process.env.KITEPROP_SYNC_TIMEZONE || 'UTC',
     },
   },
