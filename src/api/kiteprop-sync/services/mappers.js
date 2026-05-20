@@ -61,10 +61,10 @@ function mapObjetivo(remote) {
 }
 
 function mapPrecio(remote) {
-  if (remote.for_sale && remote.for_sale_price != null) return Number(remote.for_sale_price);
-  if (remote.for_rent && remote.for_rent_price != null) return Number(remote.for_rent_price);
+  if (remote.for_sale && remote.for_sale_price != null) return Math.round(Number(remote.for_sale_price));
+  if (remote.for_rent && remote.for_rent_price != null) return Math.round(Number(remote.for_rent_price));
   if (remote.for_temp_rental && remote.for_temp_rental_price_month != null) {
-    return Number(remote.for_temp_rental_price_month);
+    return Math.round(Number(remote.for_temp_rental_price_month));
   }
   return null;
 }

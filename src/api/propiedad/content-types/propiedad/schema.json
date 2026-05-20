@@ -54,7 +54,7 @@
       "type": "string"
     },
     "Precio": {
-      "type": "decimal"
+      "type": "biginteger"
     },
     "Precio_CLP": {
       "type": "biginteger"
