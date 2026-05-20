@@ -5,6 +5,52 @@ const path = require('path');
 const mime = require('mime-types');
 const { categories, authors, articles, global, about } = require('../data/data.json');
 
+const KITEPROP_INTERVAL_KEY = Symbol.for('propinvest.kitepropSyncInterval');
+
+function isKitepropSyncEnabled() {
+  return String(process.env.KITEPROP_SYNC_ENABLED || 'false').toLowerCase() === 'true';
+}
+
+function isKitepropDryRunDefault() {
+  return String(process.env.KITEPROP_SYNC_DRY_RUN || 'true').toLowerCase() === 'true';
+}
+
+function readEnvNumber(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback;
+}
+
+function startKitepropSyncInterval() {
+  if (!isKitepropSyncEnabled()) return;
+  if (String(process.env.KITEPROP_SYNC_INTERVAL_DISABLED || 'false').toLowerCase() === 'true') return;
+  if (global[KITEPROP_INTERVAL_KEY]) return;
+
+  const intervalMs = readEnvNumber('KITEPROP_SYNC_INTERVAL_MS', 10 * 60 * 1000);
+  const maxItems = readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 2);
+  const maxPages = readEnvNumber('KITEPROP_SYNC_INTERVAL_MAX_PAGES', 1);
+
+  async function runIntervalSync() {
+    const dryRun = isKitepropDryRunDefault();
+    try {
+      const sync = strapi.service('api::kiteprop-sync.properties-sync');
+      await sync.runDelta({ source: 'interval:delta', dryRun, maxPages, maxItems });
+      await sync.runSniffer({ source: 'interval:sniffer', dryRun, maxPages, maxItems });
+    } catch (err) {
+      strapi.log.error(`[kiteprop-sync][interval] failed: ${err.message}`);
+    }
+  }
+
+  strapi.log.info(
+    `[kiteprop-sync][interval] enabled every ${intervalMs}ms, maxItems=${maxItems}, maxPages=${maxPages}`
+  );
+
+  global[KITEPROP_INTERVAL_KEY] = setInterval(runIntervalSync, intervalMs);
+  global[KITEPROP_INTERVAL_KEY].unref?.();
+  setTimeout(runIntervalSync, 60 * 1000).unref?.();
+}
+
 async function seedExampleApp() {
   const shouldImportSeedData = await isFirstRun();
 
@@ -271,4 +317,5 @@ async function main() {
 
 module.exports = async () => {
   await seedExampleApp();
+  startKitepropSyncInterval();
 };
