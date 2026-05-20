@@ -40,7 +40,7 @@ jobs:
             --request POST \
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             --header "Content-Type: application/json" \
-            --data '{"dryRun":false,"maxPages":1,"maxItems":2}' \
+            --data '{"dryRun":false,"maxPages":1,"maxItems":1}' \
             "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-delta")"
           echo "$response"
           test "$(echo "$response" | jq -r '.result.summary.errors // 0')" = "0"
@@ -56,7 +56,7 @@ jobs:
             --request POST \
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             --header "Content-Type: application/json" \
-            --data '{"dryRun":false,"maxPages":1,"maxItems":2}' \
+            --data '{"dryRun":false,"maxPages":1,"maxItems":1}' \
             "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-sniffer")"
           echo "$response"
           test "$(echo "$response" | jq -r '.result.summary.errors // 0')" = "0"

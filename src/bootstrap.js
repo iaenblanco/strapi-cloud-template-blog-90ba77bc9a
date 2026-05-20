@@ -28,7 +28,7 @@ function startKitepropSyncInterval() {
   if (global[KITEPROP_INTERVAL_KEY]) return;
 
   const intervalMs = readEnvNumber('KITEPROP_SYNC_INTERVAL_MS', 10 * 60 * 1000);
-  const maxItems = readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 2);
+  const maxItems = readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1);
   const maxPages = readEnvNumber('KITEPROP_SYNC_INTERVAL_MAX_PAGES', 1);
 
   async function runIntervalSync() {

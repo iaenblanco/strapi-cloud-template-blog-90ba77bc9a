@@ -182,7 +182,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
   async function buildImageRelationPayload(kp, existing, ctx) {
     if (!isImageImportEnabled()) return undefined;
 
-    const images = mappers.mapKitepropImagenes(kp.images_list);
+    const maxImages = readEnvNumber('KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY', 12);
+    const images = mappers.mapKitepropImagenes(kp.images_list).slice(0, maxImages);
     if (images.length === 0) return [];
 
     const uploadedIds = [];
@@ -663,7 +664,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 20);
     const maxItems = readPositiveNumber(
       opts.maxItems,
-      readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 3)
+      readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1)
     );
     const pageSize = readEnvNumber('KITEPROP_SYNC_PAGE_SIZE_PROPERTIES', 50);
 
@@ -911,7 +912,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_SNIFFER_MAX_PAGES', 5);
     const maxItems = readPositiveNumber(
       opts.maxItems,
-      readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 3)
+      readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1)
     );
 
     // Dry-run is strictly read-only against sync-state. We do NOT acquire the
