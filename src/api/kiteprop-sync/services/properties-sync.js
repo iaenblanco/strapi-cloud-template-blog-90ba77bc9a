@@ -182,8 +182,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
   async function buildImageRelationPayload(kp, existing, ctx) {
     if (!isImageImportEnabled()) return undefined;
 
-    const maxImages = readEnvNumber('KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY', 12);
-    const images = mappers.mapKitepropImagenes(kp.images_list).slice(0, maxImages);
+    const images = mappers.mapKitepropImagenes(kp.images_list);
     if (images.length === 0) return [];
 
     const uploadedIds = [];
