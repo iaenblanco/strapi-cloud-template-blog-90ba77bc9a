@@ -23,12 +23,22 @@ jobs:
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/health"
 
-      - name: Run KiteProp sync
+      - name: Run KiteProp delta sync
         run: |
           curl --fail --show-error --silent \
-            --max-time 900 \
+            --max-time 240 \
             --request POST \
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             --header "Content-Type: application/json" \
-            --data '{"dryRun":false}' \
-            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-all"
+            --data '{"dryRun":false,"maxPages":1,"maxItems":2}' \
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-delta"
+
+      - name: Run KiteProp new-property sync
+        run: |
+          curl --fail --show-error --silent \
+            --max-time 240 \
+            --request POST \
+            --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"dryRun":false,"maxPages":1,"maxItems":2}' \
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-sniffer"

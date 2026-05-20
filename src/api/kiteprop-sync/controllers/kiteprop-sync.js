@@ -87,7 +87,7 @@ module.exports = {
 
   /**
    * Run delta sync via /properties/activities (cursor-based).
-   * Body: { dryRun?: boolean, fromActivityId?: number, maxPages?: number }
+   * Body: { dryRun?: boolean, fromActivityId?: number, maxPages?: number, maxItems?: number }
    */
   async runDelta(ctx) {
     const dryRun = resolveDryRun(ctx);
@@ -98,13 +98,14 @@ module.exports = {
       source: 'manual:runDelta',
       fromActivityId: body.fromActivityId ? Number(body.fromActivityId) : undefined,
       maxPages: body.maxPages ? Number(body.maxPages) : undefined,
+      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
     });
     ctx.body = { ok: true, dry_run: dryRun, result };
   },
 
   /**
    * Run id-desc sniffer for newly created properties.
-   * Body: { dryRun?: boolean, maxPages?: number }
+   * Body: { dryRun?: boolean, maxPages?: number, maxItems?: number }
    */
   async runSniffer(ctx) {
     const dryRun = resolveDryRun(ctx);
@@ -114,6 +115,7 @@ module.exports = {
       dryRun,
       source: 'manual:runSniffer',
       maxPages: body.maxPages ? Number(body.maxPages) : undefined,
+      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
     });
     ctx.body = { ok: true, dry_run: dryRun, result };
   },
@@ -123,9 +125,20 @@ module.exports = {
    */
   async runAll(ctx) {
     const dryRun = resolveDryRun(ctx);
+    const body = ctx.request.body || {};
     const sync = strapi.service('api::kiteprop-sync.properties-sync');
-    const delta = await sync.runDelta({ dryRun, source: 'manual:runAll' });
-    const sniffer = await sync.runSniffer({ dryRun, source: 'manual:runAll' });
+    const delta = await sync.runDelta({
+      dryRun,
+      source: 'manual:runAll',
+      maxPages: body.maxPages ? Number(body.maxPages) : undefined,
+      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
+    });
+    const sniffer = await sync.runSniffer({
+      dryRun,
+      source: 'manual:runAll',
+      maxPages: body.maxPages ? Number(body.maxPages) : undefined,
+      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
+    });
     ctx.body = { ok: true, dry_run: dryRun, delta, sniffer };
   },
 

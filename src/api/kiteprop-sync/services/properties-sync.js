@@ -49,6 +49,12 @@ function readEnvNumber(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function readPositiveNumber(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.trunc(n);
+}
+
 function readDeleteStrategy() {
   const raw = String(process.env.KITEPROP_DELETE_STRATEGY || 'soft').toLowerCase();
   if (raw !== 'soft') {
@@ -655,6 +661,10 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const source = opts.source || 'runDelta';
     const startedAt = Date.now();
     const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 20);
+    const maxItems = readPositiveNumber(
+      opts.maxItems,
+      readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 3)
+    );
     const pageSize = readEnvNumber('KITEPROP_SYNC_PAGE_SIZE_PROPERTIES', 50);
 
     // Dry-run is strictly read-only against sync-state. We do NOT acquire the
@@ -679,6 +689,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const deletionsProcessed = new Set();
     let lastError = null;
     let activitiesSeen = 0;
+    let itemsProcessed = 0;
     let abortedAtActivityId = null;
     let lastSuccessfulActivityId = null;
 
@@ -697,12 +708,13 @@ module.exports = ({ strapi: _strapi } = {}) => {
         resource: 'property',
         action: 'delta',
         status: 'ok',
-        message: `start runDelta from activity_id>${fromActivityId}, maxPages=${maxPages}${dryRun ? ' (dry-run: cursor will NOT advance)' : ''}`,
+        message: `start runDelta from activity_id>${fromActivityId}, maxPages=${maxPages}, maxItems=${maxItems}${dryRun ? ' (dry-run: cursor will NOT advance)' : ''}`,
         dry_run: dryRun,
       });
 
       let page = 1;
-      while (page <= maxPages && abortedAtActivityId === null) {
+      let maxItemsReached = false;
+      while (page <= maxPages && abortedAtActivityId === null && !maxItemsReached) {
         const res = await client().listActivities({
           page,
           limit: pageSize,
@@ -746,12 +758,14 @@ module.exports = ({ strapi: _strapi } = {}) => {
           // the activity forever.
           let activityFailed = false;
           let activityFailureReason = null;
+          let processedThisActivity = false;
 
           if (activity.type === ACTIVITY_TYPE_DELETE) {
             if (!deletionsProcessed.has(propertyId)) {
               const r = await softDeleteProperty(propertyId, { runId, dryRun, source });
               items.push(r);
               deletionsProcessed.add(propertyId);
+              processedThisActivity = true;
               if (r && r.status === 'error') {
                 activityFailed = true;
                 activityFailureReason = r.message || 'softDeleteProperty returned error';
@@ -763,6 +777,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
               const r = await syncOne(propertyId, { runId, dryRun, source });
               items.push(...r.items);
               propertiesProcessed.add(propertyId);
+              processedThisActivity = true;
               const failedItem = (r.items || []).find((it) => it && it.status === 'error');
               if (failedItem) {
                 activityFailed = true;
@@ -798,9 +813,18 @@ module.exports = ({ strapi: _strapi } = {}) => {
           // Success path: advance cursor (only on real runs).
           if (!dryRun) await state().bumpActivityCursor(activity);
           lastSuccessfulActivityId = activityId;
+
+          if (processedThisActivity) {
+            itemsProcessed += 1;
+            if (itemsProcessed >= maxItems) {
+              maxItemsReached = true;
+              break;
+            }
+          }
         }
 
         if (abortedAtActivityId !== null) break;
+        if (maxItemsReached) break;
         if (!advanced) break;
         if (activities.length < pageSize) break;
         page += 1;
@@ -821,6 +845,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
     const summary = summarize(items);
     summary.activities_seen = activitiesSeen;
+    summary.items_processed = itemsProcessed;
+    summary.max_items = maxItems;
     summary.last_successful_activity_id = lastSuccessfulActivityId;
     summary.aborted_at_activity_id = abortedAtActivityId;
 
@@ -883,6 +909,10 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const startedAt = Date.now();
     const pageSize = readEnvNumber('KITEPROP_SYNC_PAGE_SIZE_PROPERTIES', 50);
     const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_SNIFFER_MAX_PAGES', 5);
+    const maxItems = readPositiveNumber(
+      opts.maxItems,
+      readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 3)
+    );
 
     // Dry-run is strictly read-only against sync-state. We do NOT acquire the
     // lock and we do NOT advance last_max_property_id (that happens inside
@@ -921,7 +951,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
         resource: 'property',
         action: 'sniffer',
         status: 'ok',
-        message: `start runSniffer knownMaxId=${knownMaxId} maxPages=${effectiveMaxPages}${isFirstRun ? ' (first-run; capped to 1 page)' : ''}${dryRun ? ' (dry-run: state will NOT advance)' : ''}`,
+        message: `start runSniffer knownMaxId=${knownMaxId} maxPages=${effectiveMaxPages}, maxItems=${maxItems}${isFirstRun ? ' (first-run; capped to 1 page)' : ''}${dryRun ? ' (dry-run: state will NOT advance)' : ''}`,
         dry_run: dryRun,
       });
 
@@ -967,11 +997,12 @@ module.exports = ({ strapi: _strapi } = {}) => {
         resource: 'property',
         action: 'sniffer',
         status: 'ok',
-        message: `collected ${candidateIds.length} candidate id(s) > ${knownMaxId}; processing ascending`,
+        message: `collected ${candidateIds.length} candidate id(s) > ${knownMaxId}; processing up to ${maxItems} ascending`,
         dry_run: dryRun,
       });
 
-      for (const candidateId of candidateIds) {
+      const candidateIdsToProcess = candidateIds.slice(0, maxItems);
+      for (const candidateId of candidateIdsToProcess) {
         const r = await syncOne(candidateId, { runId, dryRun, source });
         items.push(...r.items);
 
@@ -1023,6 +1054,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const summary = summarize(items);
     summary.properties_seen = propertiesSeen;
     summary.candidates_count = candidateIds.length;
+    summary.items_processed = items.length;
+    summary.max_items = maxItems;
     summary.first_run = isFirstRun;
     summary.last_successful_property_id = lastSuccessfulPropertyId;
     summary.aborted_at_property_id = abortedAtPropertyId;
