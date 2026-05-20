@@ -1,0 +1,34 @@
+name: KiteProp Sync
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Validate required secrets
+        run: |
+          test -n "${{ secrets.STRAPI_SYNC_URL }}"
+          test -n "${{ secrets.STRAPI_SYNC_TOKEN }}"
+
+      - name: Check backend health
+        run: |
+          curl --fail --show-error --silent \
+            --max-time 60 \
+            --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/health"
+
+      - name: Run KiteProp sync
+        run: |
+          curl --fail --show-error --silent \
+            --max-time 900 \
+            --request POST \
+            --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{"dryRun":false}' \
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-all"
