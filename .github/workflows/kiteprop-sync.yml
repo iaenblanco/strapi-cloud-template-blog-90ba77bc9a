@@ -25,20 +25,26 @@ jobs:
 
       - name: Run KiteProp delta sync
         run: |
-          curl --fail --show-error --silent \
+          response="$(curl --fail --show-error --silent \
             --max-time 240 \
             --request POST \
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             --header "Content-Type: application/json" \
             --data '{"dryRun":false,"maxPages":1,"maxItems":2}' \
-            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-delta"
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-delta")"
+          echo "$response"
+          test "$(echo "$response" | jq -r '.result.summary.errors // 0')" = "0"
+          test "$(echo "$response" | jq -r '.result.error // ""')" = ""
 
       - name: Run KiteProp new-property sync
         run: |
-          curl --fail --show-error --silent \
+          response="$(curl --fail --show-error --silent \
             --max-time 240 \
             --request POST \
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             --header "Content-Type: application/json" \
             --data '{"dryRun":false,"maxPages":1,"maxItems":2}' \
-            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-sniffer"
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-sniffer")"
+          echo "$response"
+          test "$(echo "$response" | jq -r '.result.summary.errors // 0')" = "0"
+          test "$(echo "$response" | jq -r '.result.error // ""')" = ""

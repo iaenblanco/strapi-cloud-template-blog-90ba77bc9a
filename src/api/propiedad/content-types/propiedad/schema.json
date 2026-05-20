@@ -57,7 +57,7 @@
       "type": "decimal"
     },
     "Precio_CLP": {
-      "type": "integer"
+      "type": "biginteger"
     },
     "Gastos_comunes": {
       "type": "integer"
