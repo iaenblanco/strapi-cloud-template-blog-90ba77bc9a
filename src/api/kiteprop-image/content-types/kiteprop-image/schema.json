@@ -1,0 +1,68 @@
+{
+  "kind": "collectionType",
+  "collectionName": "kiteprop_images",
+  "info": {
+    "singularName": "kiteprop-image",
+    "pluralName": "kiteprop-images",
+    "displayName": "KiteProp Image",
+    "description": "Technical mapping between KiteProp remote images and Strapi Media Library files."
+  },
+  "options": {
+    "draftAndPublish": false
+  },
+  "pluginOptions": {
+    "content-manager": {
+      "visible": true
+    },
+    "content-type-builder": {
+      "visible": false
+    }
+  },
+  "attributes": {
+    "kiteprop_property_id": {
+      "type": "string",
+      "required": true
+    },
+    "image_key": {
+      "type": "string",
+      "required": true,
+      "unique": true
+    },
+    "remote_image_id": {
+      "type": "string"
+    },
+    "remote_url": {
+      "type": "text",
+      "required": true
+    },
+    "remote_url_hash": {
+      "type": "string",
+      "required": true
+    },
+    "order": {
+      "type": "integer"
+    },
+    "file": {
+      "type": "media",
+      "multiple": false,
+      "allowedTypes": [
+        "images"
+      ]
+    },
+    "last_seen_at": {
+      "type": "datetime"
+    },
+    "status": {
+      "type": "enumeration",
+      "enum": [
+        "active",
+        "stale",
+        "error"
+      ],
+      "default": "active"
+    },
+    "last_error": {
+      "type": "text"
+    }
+  }
+}

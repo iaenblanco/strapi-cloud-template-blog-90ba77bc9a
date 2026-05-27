@@ -31,6 +31,9 @@
     "action": {
       "type": "string"
     },
+    "step": {
+      "type": "string"
+    },
     "kiteprop_id": {
       "type": "biginteger"
     },

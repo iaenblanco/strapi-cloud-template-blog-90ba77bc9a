@@ -166,6 +166,24 @@
     "kiteprop_synced_at": {
       "type": "datetime"
     },
+    "kiteprop_data_hash": {
+      "type": "string"
+    },
+    "kiteprop_images_hash": {
+      "type": "string"
+    },
+    "kiteprop_last_synced_at": {
+      "type": "datetime"
+    },
+    "kiteprop_last_images_synced_at": {
+      "type": "datetime"
+    },
+    "kiteprop_sync_status": {
+      "type": "string"
+    },
+    "kiteprop_sync_error": {
+      "type": "text"
+    },
     "kiteprop_imagenes": {
       "type": "json"
     },

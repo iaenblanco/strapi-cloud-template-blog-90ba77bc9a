@@ -12,6 +12,7 @@
  *   POST   /kiteprop-sync/properties/run-delta     (activities-based delta)
  *   POST   /kiteprop-sync/properties/run-sniffer   (id-desc sniffer for new entries)
  *   POST   /kiteprop-sync/properties/run-all       (delta + sniffer in one call)
+ *   POST   /kiteprop-sync/properties/run-next      (one changed/new property)
  *   GET    /kiteprop-sync/state                    (read sync-state)
  *
  * Dry-run is controlled by:
@@ -56,6 +57,8 @@ module.exports = {
           sync_enabled: String(process.env.KITEPROP_SYNC_ENABLED || 'false') === 'true',
           dry_run_default: String(process.env.KITEPROP_SYNC_DRY_RUN || 'true') === 'true',
           delete_strategy: process.env.KITEPROP_DELETE_STRATEGY || 'soft',
+          import_images: String(process.env.KITEPROP_SYNC_IMPORT_IMAGES || 'true') === 'true',
+          max_images_per_property: Number(process.env.KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY || 12),
         },
       };
     } catch (err) {
@@ -118,6 +121,24 @@ module.exports = {
       maxItems: body.maxItems ? Number(body.maxItems) : undefined,
     });
     ctx.body = { ok: true, dry_run: dryRun, result };
+  },
+
+  /**
+   * Run one professional per-property sync candidate.
+   * Body: { dryRun?: boolean, maxPages?: number, maxItems?: number }
+   */
+  async runNext(ctx) {
+    const dryRun = resolveDryRun(ctx);
+    const body = ctx.request.body || {};
+    const sync = strapi.service('api::kiteprop-sync.properties-sync');
+    const result = await sync.runNext({
+      dryRun,
+      source: 'manual:runNext',
+      maxPages: body.maxPages ? Number(body.maxPages) : undefined,
+      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
+    });
+    ctx.status = result.ok ? 200 : 500;
+    ctx.body = result;
   },
 
   /**

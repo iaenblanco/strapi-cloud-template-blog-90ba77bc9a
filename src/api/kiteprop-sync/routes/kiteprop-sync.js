@@ -41,6 +41,12 @@ module.exports = {
     },
     {
       method: 'POST',
+      path: '/kiteprop-sync/properties/run-next',
+      handler: 'kiteprop-sync.runNext',
+      config: { policies: policy, auth: false },
+    },
+    {
+      method: 'POST',
       path: '/kiteprop-sync/properties/run-all',
       handler: 'kiteprop-sync.runAll',
       config: { policies: policy, auth: false },

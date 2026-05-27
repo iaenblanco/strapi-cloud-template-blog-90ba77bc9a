@@ -12,7 +12,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - name: Validate required secrets
@@ -30,34 +30,18 @@ jobs:
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/health"
 
-      - name: Run KiteProp delta sync
+      - name: Run next KiteProp property sync
         run: |
           response="$(curl --fail --show-error --silent \
-            --max-time 240 \
-            --retry 3 \
+            --max-time 300 \
+            --retry 2 \
             --retry-delay 10 \
             --retry-all-errors \
             --request POST \
             --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
             --header "Content-Type: application/json" \
             --data '{"dryRun":false,"maxPages":1,"maxItems":1}' \
-            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-delta")"
+            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-next")"
           echo "$response"
-          test "$(echo "$response" | jq -r '.result.summary.errors // 0')" = "0"
-          test "$(echo "$response" | jq -r '.result.error // ""')" = ""
-
-      - name: Run KiteProp new-property sync
-        run: |
-          response="$(curl --fail --show-error --silent \
-            --max-time 240 \
-            --retry 3 \
-            --retry-delay 10 \
-            --retry-all-errors \
-            --request POST \
-            --header "Authorization: Bearer ${{ secrets.STRAPI_SYNC_TOKEN }}" \
-            --header "Content-Type: application/json" \
-            --data '{"dryRun":false,"maxPages":1,"maxItems":1}' \
-            "${{ secrets.STRAPI_SYNC_URL }}/api/kiteprop-sync/properties/run-sniffer")"
-          echo "$response"
-          test "$(echo "$response" | jq -r '.result.summary.errors // 0')" = "0"
-          test "$(echo "$response" | jq -r '.result.error // ""')" = ""
+          test "$(echo "$response" | jq -r '.ok')" = "true"
+          test "$(echo "$response" | jq -r '(.errors // []) | length')" = "0"

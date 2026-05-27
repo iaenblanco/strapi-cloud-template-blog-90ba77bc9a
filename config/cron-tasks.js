@@ -13,8 +13,8 @@
  *   KITEPROP_SYNC_DRY_RUN=false   (optional; default keeps dry-run on)
  *
  * Default schedules (override via env):
- *   KITEPROP_SYNC_PROPERTIES_DELTA_CRON   default: every 5 minutes
- *   KITEPROP_SYNC_PROPERTIES_SNIFFER_CRON default: every 5 minutes (offset by 30s)
+ *   KITEPROP_SYNC_PROPERTIES_DELTA_CRON   default: every 10 minutes
+ *   KITEPROP_SYNC_PROPERTIES_SNIFFER_CRON default: every 10 minutes (offset by 5m)
  */
 
 function isSyncEnabled() {
@@ -25,8 +25,8 @@ function isDryRunDefault() {
   return String(process.env.KITEPROP_SYNC_DRY_RUN || 'true').toLowerCase() === 'true';
 }
 
-const DELTA_CRON = process.env.KITEPROP_SYNC_PROPERTIES_DELTA_CRON || '*/5 * * * *';
-const SNIFFER_CRON = process.env.KITEPROP_SYNC_PROPERTIES_SNIFFER_CRON || '30 */5 * * * *';
+const DELTA_CRON = process.env.KITEPROP_SYNC_PROPERTIES_DELTA_CRON || '*/10 * * * *';
+const SNIFFER_CRON = process.env.KITEPROP_SYNC_PROPERTIES_SNIFFER_CRON || '5-59/10 * * * *';
 
 module.exports = {
   'kiteprop-properties-delta': {
@@ -37,7 +37,7 @@ module.exports = {
       }
       try {
         const sync = strapi.service('api::kiteprop-sync.properties-sync');
-        await sync.runDelta({ source: 'cron:delta', dryRun: isDryRunDefault() });
+        await sync.runDelta({ source: 'cron:delta', dryRun: isDryRunDefault(), maxPages: 1, maxItems: 1 });
       } catch (err) {
         strapi.log.error(`[kiteprop-sync][cron] delta failed: ${err.message}`);
       }
@@ -55,7 +55,7 @@ module.exports = {
       }
       try {
         const sync = strapi.service('api::kiteprop-sync.properties-sync');
-        await sync.runSniffer({ source: 'cron:sniffer', dryRun: isDryRunDefault() });
+        await sync.runSniffer({ source: 'cron:sniffer', dryRun: isDryRunDefault(), maxPages: 1, maxItems: 1 });
       } catch (err) {
         strapi.log.error(`[kiteprop-sync][cron] sniffer failed: ${err.message}`);
       }

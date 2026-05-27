@@ -27,6 +27,7 @@ const path = require('path');
 const mime = require('mime-types');
 
 const PROPIEDAD_UID = 'api::propiedad.propiedad';
+const KITEPROP_IMAGE_UID = 'api::kiteprop-image.kiteprop-image';
 
 const ACTIVITY_TYPE_DELETE = 'delete_property';
 const ACTIVITY_TYPES_RELEVANT = new Set([
@@ -68,9 +69,12 @@ function readDeleteStrategy() {
 module.exports = ({ strapi: _strapi } = {}) => {
   const client = () => strapi.service('api::kiteprop-sync.client');
   const mappers = require('./mappers');
+  const hashes = require('./hash');
+  const imageHelpers = require('./images');
   const state = () => strapi.service('api::kiteprop-sync.state');
   const logger = () => strapi.service('api::kiteprop-sync.logger');
   const docs = () => strapi.documents(PROPIEDAD_UID);
+  const imageDocs = () => strapi.documents(KITEPROP_IMAGE_UID);
 
   /**
    * Find an existing Strapi propiedad by KiteProp id.
@@ -81,7 +85,17 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const found = await docs().findFirst({
       filters: { kiteprop_id: Number(kitepropId) },
       // We need kiteprop_updated_at for idempotency and Publicado for delete decisions.
-      fields: ['id', 'documentId', 'kiteprop_id', 'kiteprop_updated_at', 'kiteprop_status', 'Publicado'],
+      fields: [
+        'id',
+        'documentId',
+        'kiteprop_id',
+        'kiteprop_updated_at',
+        'kiteprop_status',
+        'kiteprop_data_hash',
+        'kiteprop_images_hash',
+        'kiteprop_sync_status',
+        'Publicado',
+      ],
       populate: {
         Imagenes: {
           fields: ['id', 'name', 'url'],
@@ -96,22 +110,56 @@ module.exports = ({ strapi: _strapi } = {}) => {
     return String(process.env.KITEPROP_SYNC_IMPORT_IMAGES || 'true').toLowerCase() === 'true';
   }
 
-  function pickImageUrl(image) {
-    return image?.lg || image?.md || image?.sm || image?.url || null;
+  function maxImagesPerProperty() {
+    return readPositiveNumber(
+      process.env.KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY,
+      12
+    );
   }
 
-  function buildImageName(kitepropId, image, index) {
-    const remoteKey =
-      image?.id ||
-      crypto.createHash('sha1').update(pickImageUrl(image) || String(index)).digest('hex').slice(0, 10);
-    return `kiteprop-${kitepropId}-${remoteKey}`;
+  function buildImageName(normalizedImage) {
+    return `kiteprop-${normalizedImage.image_key.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
   }
 
-  async function findUploadedImageByName(name) {
-    return strapi.db.query('plugin::upload.file').findOne({
-      where: { name },
-      select: ['id', 'name', 'url'],
+  async function findKitepropImage(normalizedImage) {
+    return imageDocs().findFirst({
+      filters: {
+        kiteprop_property_id: normalizedImage.kiteprop_property_id,
+        image_key: normalizedImage.image_key,
+      },
+      fields: [
+        'id',
+        'documentId',
+        'kiteprop_property_id',
+        'image_key',
+        'remote_image_id',
+        'remote_url',
+        'remote_url_hash',
+        'order',
+        'status',
+      ],
+      populate: {
+        file: {
+          fields: ['id', 'name', 'url'],
+        },
+      },
     });
+  }
+
+  async function findLegacyUploadedImage(normalizedImage) {
+    const legacyKeys = [];
+    if (normalizedImage.remote_image_id) legacyKeys.push(normalizedImage.remote_image_id);
+    legacyKeys.push(normalizedImage.remote_url_hash.slice(0, 10));
+
+    for (const key of legacyKeys) {
+      const name = `kiteprop-${normalizedImage.kiteprop_property_id}-${key}`;
+      const found = await strapi.db.query('plugin::upload.file').findOne({
+        where: { name },
+        select: ['id', 'name', 'url'],
+      });
+      if (found?.id) return found;
+    }
+    return null;
   }
 
   async function downloadRemoteImage(url, name) {
@@ -152,23 +200,19 @@ module.exports = ({ strapi: _strapi } = {}) => {
     }
   }
 
-  async function uploadKitepropImage({ kitepropId, image, index }) {
-    const url = pickImageUrl(image);
-    if (!url) return null;
-
-    const name = buildImageName(kitepropId, image, index);
-    const existing = await findUploadedImageByName(name);
-    if (existing) return existing;
-
+  async function uploadKitepropImage(normalizedImage) {
+    const name = buildImageName(normalizedImage);
     let file;
     try {
-      file = await downloadRemoteImage(url, name);
+      file = await downloadRemoteImage(normalizedImage.remote_url, name);
       const uploaded = await strapi.plugin('upload').service('upload').upload({
         data: {
           fileInfo: {
             name,
-            alternativeText: image?.title || `KiteProp property ${kitepropId}`,
-            caption: image?.title || null,
+            alternativeText:
+              normalizedImage.title ||
+              `KiteProp property ${normalizedImage.kiteprop_property_id}`,
+            caption: normalizedImage.title || null,
           },
         },
         files: file,
@@ -179,39 +223,155 @@ module.exports = ({ strapi: _strapi } = {}) => {
     }
   }
 
-  async function buildImageRelationPayload(kp, existing, ctx) {
-    if (!isImageImportEnabled()) return undefined;
+  async function markImageMappingError(normalizedImage, err, ctx) {
+    const existing = await findKitepropImage(normalizedImage).catch(() => null);
+    if (!existing || ctx.dryRun) return;
+    await imageDocs().update({
+      documentId: existing.documentId,
+      data: {
+        status: 'error',
+        last_error: String(err?.message || err).slice(0, 1000),
+        last_seen_at: new Date().toISOString(),
+      },
+    }).catch(() => {});
+  }
 
-    const images = mappers.mapKitepropImagenes(kp.images_list);
-    if (images.length === 0) return [];
+  async function resolveOneImage(normalizedImage, ctx, stats) {
+    const existing = await findKitepropImage(normalizedImage);
 
-    const uploadedIds = [];
-    for (let i = 0; i < images.length; i += 1) {
-      try {
-        const uploaded = await uploadKitepropImage({
-          kitepropId: kp.id,
-          image: images[i],
-          index: i,
+    if (existing?.file?.id) {
+      if (String(existing.kiteprop_property_id) !== normalizedImage.kiteprop_property_id) {
+        throw new Error(
+          `image_key ${normalizedImage.image_key} belongs to property ${existing.kiteprop_property_id}, not ${normalizedImage.kiteprop_property_id}`
+        );
+      }
+      stats.images_reused += 1;
+      if (!ctx.dryRun) {
+        await imageDocs().update({
+          documentId: existing.documentId,
+          data: {
+            remote_url: normalizedImage.remote_url,
+            remote_url_hash: normalizedImage.remote_url_hash,
+            remote_image_id: normalizedImage.remote_image_id,
+            order: normalizedImage.order,
+            last_seen_at: new Date().toISOString(),
+            status: 'active',
+            last_error: null,
+          },
         });
-        if (uploaded?.id) uploadedIds.push(uploaded.id);
+      }
+      return existing.file.id;
+    }
+
+    if (ctx.dryRun) {
+      stats.images_uploaded += 1;
+      return null;
+    }
+
+    let uploaded = await findLegacyUploadedImage(normalizedImage);
+    if (uploaded?.id) {
+      stats.images_reused += 1;
+    } else {
+      uploaded = await uploadKitepropImage(normalizedImage);
+      if (!uploaded?.id) throw new Error(`upload did not return a file id for ${normalizedImage.image_key}`);
+      stats.images_uploaded += 1;
+    }
+
+    const mappingPayload = {
+      kiteprop_property_id: normalizedImage.kiteprop_property_id,
+      image_key: normalizedImage.image_key,
+      remote_image_id: normalizedImage.remote_image_id,
+      remote_url: normalizedImage.remote_url,
+      remote_url_hash: normalizedImage.remote_url_hash,
+      order: normalizedImage.order,
+      file: uploaded.id,
+      last_seen_at: new Date().toISOString(),
+      status: 'active',
+      last_error: null,
+    };
+
+    if (existing?.documentId) {
+      await imageDocs().update({
+        documentId: existing.documentId,
+        data: mappingPayload,
+      });
+    } else {
+      await imageDocs().create({ data: mappingPayload });
+    }
+
+    return uploaded.id;
+  }
+
+  async function syncImageRelation({ kp, existing, remoteImagesHash, normalizedImages, ctx }) {
+    const stats = {
+      images_changed: false,
+      images_uploaded: 0,
+      images_reused: 0,
+      images_linked: Array.isArray(existing?.Imagenes) ? existing.Imagenes.length : 0,
+      imageIds: undefined,
+    };
+
+    if (!isImageImportEnabled()) {
+      await logger().record({
+        run_id: ctx.runId,
+        source: ctx.source,
+        resource: 'property',
+        action: 'images',
+        kiteprop_id: kp.id,
+        status: 'noop',
+        message: 'image import disabled by KITEPROP_SYNC_IMPORT_IMAGES=false',
+        dry_run: !!ctx.dryRun,
+      });
+      return stats;
+    }
+
+    if (existing?.kiteprop_images_hash && existing.kiteprop_images_hash === remoteImagesHash) {
+      await logger().record({
+        run_id: ctx.runId,
+        source: ctx.source,
+        resource: 'property',
+        action: 'images',
+        kiteprop_id: kp.id,
+        status: 'noop',
+        message: 'images_hash unchanged; skipping download/upload',
+        dry_run: !!ctx.dryRun,
+      });
+      return stats;
+    }
+
+    stats.images_changed = true;
+
+    if (normalizedImages.length === 0) {
+      stats.imageIds = [];
+      stats.images_linked = 0;
+      return stats;
+    }
+
+    const imageIds = [];
+    for (const normalizedImage of normalizedImages) {
+      try {
+        const fileId = await resolveOneImage(normalizedImage, ctx, stats);
+        if (fileId) imageIds.push(fileId);
       } catch (err) {
+        await markImageMappingError(normalizedImage, err, ctx);
         await logger().record({
           run_id: ctx.runId,
           source: ctx.source,
           resource: 'property',
-          action: 'error',
+          action: 'images',
           kiteprop_id: kp.id,
           status: 'error',
-          message: `image import failed: ${err.message}`,
-          error_details: { image: images[i], stack: err.stack },
+          message: `image import failed for ${normalizedImage.image_key}: ${err.message}`,
+          error_details: { image: normalizedImage, stack: err.stack },
           dry_run: !!ctx.dryRun,
         });
+        throw err;
       }
     }
 
-    if (uploadedIds.length > 0) return uploadedIds;
-    if (existing?.Imagenes?.length) return existing.Imagenes.map((img) => img.id).filter(Boolean);
-    return undefined;
+    stats.imageIds = imageIds;
+    stats.images_linked = imageIds.length;
+    return stats;
   }
 
   async function writeProperty({ existing, payload, publish }) {
@@ -247,6 +407,18 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const dryRun = !!ctx.dryRun;
     const runId = ctx.runId;
     const source = ctx.source;
+    const result = {
+      action: 'skip',
+      status: 'noop',
+      kiteprop_id: kp?.id,
+      data_changed: false,
+      images_changed: false,
+      images_uploaded: 0,
+      images_reused: 0,
+      images_linked: 0,
+      errors: [],
+      duration_ms: 0,
+    };
 
     let payload;
     try {
@@ -267,17 +439,42 @@ module.exports = ({ strapi: _strapi } = {}) => {
       return { action: 'error', status: 'error', message: err.message, kiteprop_id: kp?.id };
     }
 
+    const mappedImages = mappers.mapKitepropImagenes(kp.images_list);
+    const normalizedImages = imageHelpers.normalizeKitepropImages(
+      mappedImages,
+      payload.kiteprop_id,
+      maxImagesPerProperty()
+    );
+    const remoteDataHash = hashes.buildPropertyDataHash(payload);
+    const remoteImagesHash = hashes.buildPropertyImagesHash(normalizedImages);
     const existing = await findByKitepropId(payload.kiteprop_id);
-    const remoteImageCount = mappers.mapKitepropImagenes(kp.images_list).length;
-    const localImageCount = Array.isArray(existing?.Imagenes) ? existing.Imagenes.length : 0;
-    const imageDrift = isImageImportEnabled() && remoteImageCount !== localImageCount;
 
-    // Idempotency: skip when nothing changed.
-    if (
-      existing &&
-      !imageDrift &&
-      !mappers.isRemoteNewer(payload.kiteprop_updated_at, existing.kiteprop_updated_at)
-    ) {
+    result.kiteprop_id = payload.kiteprop_id;
+    result.documentId = existing?.documentId;
+
+    await logger().record({
+      run_id: runId,
+      source,
+      resource: 'property',
+      action: 'hash',
+      kiteprop_id: payload.kiteprop_id,
+      status: 'ok',
+      message:
+        `data_hash=${remoteDataHash.slice(0, 12)} images_hash=${remoteImagesHash.slice(0, 12)} ` +
+        `images=${normalizedImages.length}/${mappedImages.length}`,
+      dry_run: dryRun,
+    });
+
+    const dataChanged =
+      !existing ||
+      existing.kiteprop_data_hash !== remoteDataHash ||
+      mappers.isRemoteNewer(payload.kiteprop_updated_at, existing.kiteprop_updated_at);
+    const imageHashChanged = !existing || existing.kiteprop_images_hash !== remoteImagesHash;
+
+    result.data_changed = dataChanged;
+    result.images_changed = isImageImportEnabled() && imageHashChanged;
+
+    if (!dataChanged && !result.images_changed) {
       await logger().record({
         run_id: runId,
         source,
@@ -285,42 +482,111 @@ module.exports = ({ strapi: _strapi } = {}) => {
         action: 'skip',
         kiteprop_id: payload.kiteprop_id,
         status: 'noop',
-        message: `local kiteprop_updated_at >= remote (${existing.kiteprop_updated_at})`,
+        message: 'data_hash and images_hash unchanged',
         dry_run: dryRun,
         duration_ms: Date.now() - startedAt,
       });
-      return {
-        action: 'skip',
-        status: 'noop',
-        kiteprop_id: payload.kiteprop_id,
-        documentId: existing.documentId,
-      };
+      result.duration_ms = Date.now() - startedAt;
+      return result;
     }
 
-    // Decide CREATE vs UPDATE.
-    if (!existing) {
-      if (dryRun) {
-        await logger().record({
-          run_id: runId,
-          source,
-          resource: 'property',
-          action: 'create',
-          kiteprop_id: payload.kiteprop_id,
-          status: 'ok',
-          message: `[dry-run] would CREATE propiedad`,
-          dry_run: true,
-          duration_ms: Date.now() - startedAt,
-        });
-        return { action: 'create', status: 'ok', kiteprop_id: payload.kiteprop_id, dry_run: true };
+    if (dryRun) {
+      await logger().record({
+        run_id: runId,
+        source,
+        resource: 'property',
+        action: existing ? 'update' : 'create',
+        kiteprop_id: payload.kiteprop_id,
+        status: 'ok',
+        message:
+          `[dry-run] would ${existing ? 'UPDATE' : 'CREATE'} propiedad ` +
+          `(data_changed=${dataChanged}, images_changed=${result.images_changed})`,
+        dry_run: true,
+        duration_ms: Date.now() - startedAt,
+      });
+      result.action = existing ? 'update' : 'create';
+      result.status = 'ok';
+      result.dry_run = true;
+      result.duration_ms = Date.now() - startedAt;
+      return result;
+    }
+
+    let imageStats;
+    try {
+      imageStats = await syncImageRelation({
+        kp,
+        existing,
+        remoteImagesHash,
+        normalizedImages,
+        ctx,
+      });
+      result.images_changed = imageStats.images_changed;
+      result.images_uploaded = imageStats.images_uploaded;
+      result.images_reused = imageStats.images_reused;
+      result.images_linked = imageStats.images_linked;
+    } catch (err) {
+      result.action = 'error';
+      result.status = 'error';
+      result.message = err.message;
+      result.errors.push(err.message);
+      result.duration_ms = Date.now() - startedAt;
+
+      if (existing?.documentId) {
+        await docs().update({
+          documentId: existing.documentId,
+          status: 'draft',
+          data: {
+            kiteprop_sync_status: 'error',
+            kiteprop_sync_error: String(err.message).slice(0, 1000),
+          },
+        }).catch(() => {});
       }
 
-      try {
-        const imageIds = await buildImageRelationPayload(kp, existing, ctx);
-        if (imageIds !== undefined) payload.Imagenes = imageIds;
+      await logger().record({
+        run_id: runId,
+        source,
+        resource: 'property',
+        action: 'error',
+        kiteprop_id: payload.kiteprop_id,
+        status: 'error',
+        message: `images failed; property write skipped: ${err.message}`,
+        error_details: { stack: err.stack },
+        dry_run: false,
+        duration_ms: result.duration_ms,
+      });
+      return result;
+    }
 
+    const writePayload = {};
+    if (dataChanged) {
+      Object.assign(writePayload, payload, {
+        kiteprop_data_hash: remoteDataHash,
+        kiteprop_last_synced_at: new Date().toISOString(),
+        kiteprop_synced_at: new Date().toISOString(),
+      });
+    }
+
+    if (imageStats.images_changed) {
+      writePayload.Imagenes = imageStats.imageIds || [];
+      writePayload.kiteprop_images_hash = remoteImagesHash;
+      writePayload.kiteprop_last_images_synced_at = new Date().toISOString();
+      writePayload.kiteprop_imagenes = normalizedImages.map((image) => ({
+        image_key: image.image_key,
+        remote_image_id: image.remote_image_id,
+        remote_url: image.remote_url,
+        remote_url_hash: image.remote_url_hash,
+        order: image.order,
+      }));
+    }
+
+    writePayload.kiteprop_sync_status = 'ok';
+    writePayload.kiteprop_sync_error = null;
+
+    if (!existing) {
+      try {
         const created = await writeProperty({
           existing: null,
-          payload,
+          payload: writePayload,
           publish: !!payload.Publicado,
         });
         await logger().record({
@@ -334,12 +600,12 @@ module.exports = ({ strapi: _strapi } = {}) => {
           dry_run: false,
           duration_ms: Date.now() - startedAt,
         });
-        await state().bumpMaxPropertyId(payload.kiteprop_id);
         return {
+          ...result,
           action: 'create',
           status: 'ok',
-          kiteprop_id: payload.kiteprop_id,
           documentId: created.documentId,
+          duration_ms: Date.now() - startedAt,
         };
       } catch (err) {
         await logger().record({
@@ -355,43 +621,21 @@ module.exports = ({ strapi: _strapi } = {}) => {
           duration_ms: Date.now() - startedAt,
         });
         return {
+          ...result,
           action: 'error',
           status: 'error',
           message: err.message,
           kiteprop_id: payload.kiteprop_id,
+          errors: [err.message],
+          duration_ms: Date.now() - startedAt,
         };
       }
     }
 
-    // UPDATE
-    if (dryRun) {
-      await logger().record({
-        run_id: runId,
-        source,
-        resource: 'property',
-        action: 'update',
-        kiteprop_id: payload.kiteprop_id,
-        status: 'ok',
-        message: `[dry-run] would UPDATE documentId=${existing.documentId}`,
-        dry_run: true,
-        duration_ms: Date.now() - startedAt,
-      });
-      return {
-        action: 'update',
-        status: 'ok',
-        kiteprop_id: payload.kiteprop_id,
-        documentId: existing.documentId,
-        dry_run: true,
-      };
-    }
-
     try {
-      const imageIds = await buildImageRelationPayload(kp, existing, ctx);
-      if (imageIds !== undefined) payload.Imagenes = imageIds;
-
       const updated = await writeProperty({
         existing,
-        payload,
+        payload: writePayload,
         publish: !!payload.Publicado,
       });
       await logger().record({
@@ -405,12 +649,13 @@ module.exports = ({ strapi: _strapi } = {}) => {
         dry_run: false,
         duration_ms: Date.now() - startedAt,
       });
-      await state().bumpMaxPropertyId(payload.kiteprop_id);
       return {
+        ...result,
         action: 'update',
         status: 'ok',
         kiteprop_id: payload.kiteprop_id,
         documentId: updated.documentId,
+        duration_ms: Date.now() - startedAt,
       };
     } catch (err) {
       await logger().record({
@@ -426,10 +671,13 @@ module.exports = ({ strapi: _strapi } = {}) => {
         duration_ms: Date.now() - startedAt,
       });
       return {
+        ...result,
         action: 'error',
         status: 'error',
         message: err.message,
         kiteprop_id: payload.kiteprop_id,
+        errors: [err.message],
+        duration_ms: Date.now() - startedAt,
       };
     }
   }
@@ -660,7 +908,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const dryRun = !!opts.dryRun;
     const source = opts.source || 'runDelta';
     const startedAt = Date.now();
-    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 20);
+    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 1);
     const maxItems = readPositiveNumber(
       opts.maxItems,
       readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1)
@@ -887,8 +1135,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
    *
    *   PHASE 2 — PROCESS
    *     Sort the candidate ids ASCENDING and process them one by one via
-   *     syncOne(). After each successful upsert, `bumpMaxPropertyId` is
-   *     called inside upsertProperty (non-dry path only) and our local
+   *     syncOne(). After each successful candidate (create/update/noop), the
+   *     sniffer cursor advances to that id and our local
    *     `lastSuccessfulPropertyId` is recorded for the response payload.
    *
    *     If any property fails (HTTP error, mapper error, Strapi write
@@ -908,7 +1156,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const source = opts.source || 'runSniffer';
     const startedAt = Date.now();
     const pageSize = readEnvNumber('KITEPROP_SYNC_PAGE_SIZE_PROPERTIES', 50);
-    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_SNIFFER_MAX_PAGES', 5);
+    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_SNIFFER_MAX_PAGES', 1);
     const maxItems = readPositiveNumber(
       opts.maxItems,
       readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1)
@@ -916,7 +1164,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
     // Dry-run is strictly read-only against sync-state. We do NOT acquire the
     // lock and we do NOT advance last_max_property_id (that happens inside
-    // upsertProperty's non-dry branch via bumpMaxPropertyId).
+    // runSniffer's per-candidate success path via bumpMaxPropertyId).
     if (!dryRun) {
       const lock = await state().acquireLock(runId);
       if (!lock.acquired) {
@@ -1032,15 +1280,15 @@ module.exports = ({ strapi: _strapi } = {}) => {
           break;
         }
 
-        // Success path: bumpMaxPropertyId was already invoked inside
-        // upsertProperty (non-dry path), advancing the state cursor to this id.
-        // We track the high-water mark here for the response payload.
+        // Success path: only sniffer advances the id cursor. Delta/manual sync
+        // can touch high ids and must not hide lower, not-yet-sniffed creations.
+        if (!dryRun) await state().bumpMaxPropertyId(candidateId);
         lastSuccessfulPropertyId = candidateId;
       }
     } catch (err) {
       // Errors here come from listProperties (HTTP transport) or any unexpected
       // throw outside the per-item try/catch. The cursor advances ONLY through
-      // bumpMaxPropertyId on real successful upserts, so partial progress is safe.
+      // bumpMaxPropertyId on real successful sniffer candidates, so partial progress is safe.
       lastError = err;
       strapi.log.error(`[kiteprop-sync] runSniffer error: ${err.message}`);
     } finally {
@@ -1084,6 +1332,38 @@ module.exports = ({ strapi: _strapi } = {}) => {
     };
   }
 
+  async function runNext(opts = {}) {
+    const runId = opts.runId || newRunId();
+    const dryRun = !!opts.dryRun;
+    const startedAt = Date.now();
+    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 1);
+    const maxItems = 1;
+
+    const delta = await runDelta({
+      ...opts,
+      runId,
+      dryRun,
+      source: opts.source || 'runNext:delta',
+      maxPages,
+      maxItems,
+    });
+
+    if (delta.skipped || delta.error || (delta.items || []).length > 0) {
+      return formatRunNextResult(delta, startedAt);
+    }
+
+    const sniffer = await runSniffer({
+      ...opts,
+      runId,
+      dryRun,
+      source: opts.source || 'runNext:sniffer',
+      maxPages: opts.maxPages || readEnvNumber('KITEPROP_SYNC_SNIFFER_MAX_PAGES', 1),
+      maxItems,
+    });
+
+    return formatRunNextResult(sniffer, startedAt);
+  }
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -1101,16 +1381,43 @@ module.exports = ({ strapi: _strapi } = {}) => {
     return summary;
   }
 
+  function formatRunNextResult(runResult, startedAt) {
+    const item = (runResult.items || [])[0] || null;
+    const errors = [];
+    if (runResult.error) errors.push(runResult.error);
+    if (item?.status === 'error' && item.message) errors.push(item.message);
+
+    return {
+      ok: errors.length === 0,
+      run_id: runResult.run_id,
+      dry_run: !!runResult.dry_run,
+      skipped: !!runResult.skipped,
+      reason: runResult.reason || null,
+      kiteprop_id: item?.kiteprop_id || null,
+      action: item?.action || (runResult.skipped ? 'skipped' : 'skip'),
+      data_changed: !!item?.data_changed,
+      images_changed: !!item?.images_changed,
+      images_uploaded: item?.images_uploaded || 0,
+      images_reused: item?.images_reused || 0,
+      images_linked: item?.images_linked || 0,
+      errors,
+      summary: runResult.summary || null,
+      duration_ms: Date.now() - startedAt,
+    };
+  }
+
   return {
     syncOne,
     runDelta,
     runSniffer,
+    runNext,
     // Internal helpers exposed for testing/ops
     _internal: {
       upsertProperty,
       softDeleteProperty,
       findByKitepropId,
       summarize,
+      formatRunNextResult,
     },
   };
 };

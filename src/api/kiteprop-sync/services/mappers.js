@@ -275,6 +275,9 @@ function buildSoftDeletePayload() {
     Publicado: false,
     kiteprop_status: 'deleted',
     kiteprop_synced_at: new Date().toISOString(),
+    kiteprop_last_synced_at: new Date().toISOString(),
+    kiteprop_sync_status: 'ok',
+    kiteprop_sync_error: null,
   };
 }
 
