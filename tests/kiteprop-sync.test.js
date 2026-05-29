@@ -63,9 +63,57 @@ function loadReconciliationService() {
   return require('../src/api/kiteprop-sync/services/reconciliation')({});
 }
 
+function loadMappingAuditService() {
+  delete require.cache[require.resolve('../src/api/kiteprop-sync/services/mapping-audit')];
+  return require('../src/api/kiteprop-sync/services/mapping-audit')({});
+}
+
 function loadController() {
   delete require.cache[require.resolve('../src/api/kiteprop-sync/controllers/kiteprop-sync')];
   return require('../src/api/kiteprop-sync/controllers/kiteprop-sync');
+}
+
+function localPropertyFromKiteProp(kp, overrides = {}) {
+  const payload = mappers.mapPropertyToStrapi(kp);
+  const { dataHash, imagesHash, normalizedImages } = computedHashes(kp);
+  return {
+    id: 1,
+    documentId: `prop-${kp.id}`,
+    Slug: `prop-${kp.id}`,
+    ...payload,
+    kiteprop_data_hash: dataHash,
+    kiteprop_images_hash: imagesHash,
+    kiteprop_sync_status: 'ok',
+    kiteprop_sync_error: null,
+    Imagenes: normalizedImages.map((image, index) => ({
+      id: 500 + index,
+      url: `/uploads/${image.image_key}.jpg`,
+    })),
+    kiteprop_imagenes: normalizedImages.map((image) => ({
+      image_key: image.image_key,
+      remote_image_id: image.remote_image_id,
+      remote_url: image.remote_url,
+      remote_url_hash: image.remote_url_hash,
+      order: image.order,
+    })),
+    ...overrides,
+  };
+}
+
+function kitepropImageRowsFor(kp, overrides = {}) {
+  return computedHashes(kp).normalizedImages.map((image, index) => ({
+    id: 100 + index,
+    documentId: `map-${index}`,
+    kiteprop_property_id: String(kp.id),
+    image_key: image.image_key,
+    remote_image_id: image.remote_image_id,
+    remote_url: image.remote_url,
+    remote_url_hash: image.remote_url_hash,
+    order: image.order,
+    status: 'active',
+    file: { id: 500 + index, url: `/uploads/${image.image_key}.jpg` },
+    ...overrides[image.image_key],
+  }));
 }
 
 function installStrapiMock(options = {}) {
@@ -93,8 +141,12 @@ function installStrapiMock(options = {}) {
 
   const propertyDocs = {
     async findFirst({ filters } = {}) {
+      const requestedKitepropId = filters?.kiteprop_id ? Number(filters.kiteprop_id) : null;
+      if (requestedKitepropId && options.localProperties?.[requestedKitepropId]) {
+        return options.localProperties[requestedKitepropId];
+      }
       if (!currentProperty) return null;
-      if (filters?.kiteprop_id && Number(filters.kiteprop_id) !== Number(currentProperty.kiteprop_id)) {
+      if (requestedKitepropId && requestedKitepropId !== Number(currentProperty.kiteprop_id)) {
         return null;
       }
       return currentProperty;
@@ -128,6 +180,10 @@ function installStrapiMock(options = {}) {
     async update({ documentId, data }) {
       calls.imageUpdates.push({ documentId, data });
       return { documentId, ...data };
+    },
+    async findMany() {
+      if (options.kitepropImageFindManyError) throw options.kitepropImageFindManyError;
+      return options.kitepropImageRows || [];
     },
   };
 
@@ -235,6 +291,7 @@ function installStrapiMock(options = {}) {
       if (uid === 'api::kiteprop-sync.state') return state;
       if (uid === 'api::kiteprop-sync.client') return client;
       if (uid === 'api::kiteprop-sync.reconciliation') return loadReconciliationService();
+      if (uid === 'api::kiteprop-sync.mapping-audit') return loadMappingAuditService();
       throw new Error(`Unexpected service ${uid}`);
     },
     log: {
@@ -670,4 +727,246 @@ test('reconciliation health is true when ID sets match and there are no duplicat
   assert.equal(result.diff.missing_in_strapi_count, 0);
   assert.equal(result.strapi.duplicate_count, 0);
   assert.deepEqual(result.strapi.status_summary, { active: 2 });
+});
+
+test('mapping audit detects currency=clp with Precio filled as frontend risk', async () => {
+  const kp = sampleProperty({ currency: 'clp', for_sale_price: 120000000 });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.equal(result.properties[0].checks.price.front_risk.risk, 'high');
+  assert.equal(result.properties[0].checks.price.status, 'critical');
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'front_clp_price_rendered_as_uf'));
+});
+
+test('mapping audit detects Precio mismatch', async () => {
+  const kp = sampleProperty({ currency: 'uf', for_sale_price: 9000 });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Precio: 8000 }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'precio_mismatch'));
+  assert.equal(result.summary.critical_count, 1);
+});
+
+test('mapping audit detects missing Precio_CLP for CLP currency', async () => {
+  const kp = sampleProperty({ currency: 'clp', for_sale_price: 120000000 });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Precio_CLP: null }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101, checkFrontRisk: false });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'missing_precio_clp'));
+});
+
+test('mapping audit detects incorrect Objetivo', async () => {
+  const kp = sampleProperty({ for_sale: true, for_rent: false });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Objetivo: 'Arriendo' }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'objetivo_mismatch'));
+});
+
+test('mapping audit detects Tipo fallback to Otros Inmuebles', async () => {
+  const kp = sampleProperty({ type: 'castle' });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'type_fallback_otros_inmuebles'));
+});
+
+test('mapping audit detects Publicado incorrect for active status', async () => {
+  const kp = sampleProperty({ status: 'active' });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Publicado: false }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'active_not_published'));
+  assert.equal(result.properties[0].checks.status_publication.status, 'critical');
+});
+
+test('mapping audit detects specs mismatches', async () => {
+  const kp = sampleProperty({ bedrooms: 4, bathrooms: 3, total_meters: 180 });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Dormitorios: 3, Banos: 2, Superficie: 100 }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'dormitorios_mismatch'));
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'banos_mismatch'));
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'superficie_mismatch'));
+});
+
+test('mapping audit detects image_count_mismatch', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Imagenes: [] }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'image_count_mismatch'));
+});
+
+test('mapping audit detects first_image_mismatch', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp, {
+        Imagenes: [
+          { id: 501, url: '/uploads/second.jpg' },
+          { id: 500, url: '/uploads/first.jpg' },
+        ],
+      }),
+    },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'first_image_mismatch'));
+});
+
+test('mapping audit detects missing_kiteprop_image_mapping', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: kitepropImageRowsFor(kp).slice(0, 1),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'missing_kiteprop_image_mapping'));
+});
+
+test('mapping audit detects orphan_kiteprop_image_mapping', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: [
+      ...kitepropImageRowsFor(kp),
+      { id: 999, documentId: 'orphan', kiteprop_property_id: '101', image_key: '101:orphan', file: { id: 999 } },
+    ],
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'orphan_kiteprop_image_mapping'));
+});
+
+test('mapping audit detects duplicate_image_key', async () => {
+  const kp = sampleProperty();
+  const rows = kitepropImageRowsFor(kp);
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: [...rows, { ...rows[0], id: 999, documentId: 'duplicate' }],
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'duplicate_image_key'));
+});
+
+test('mapping audit detects data_hash mismatch', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { kiteprop_data_hash: 'wrong' }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'data_hash_mismatch'));
+});
+
+test('mapping audit route is protected by has-trigger-token and auth false', () => {
+  const routes = require('../src/api/kiteprop-sync/routes/kiteprop-sync').routes;
+  const route = routes.find((item) => item.method === 'GET' && item.path === '/kiteprop-sync/reconciliation/mapping-audit');
+
+  assert.ok(route);
+  assert.equal(route.handler, 'kiteprop-sync.mappingAudit');
+  assert.deepEqual(route.config.policies, ['api::kiteprop-sync.has-trigger-token']);
+  assert.equal(route.config.auth, false);
+});
+
+test('mapping audit is read-only and does not call writes or upload', async () => {
+  const kp = sampleProperty({ currency: 'uf' });
+  const calls = installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.read_only, true);
+  assert.equal(calls.propertyCreates.length, 0);
+  assert.equal(calls.propertyUpdates.length, 0);
+  assert.equal(calls.propertyUnpublishes.length, 0);
+  assert.equal(calls.imageCreates.length, 0);
+  assert.equal(calls.imageUpdates.length, 0);
+  assert.equal(calls.uploadCalls.length, 0);
+  assert.equal(calls.bumpActivityCursor.length, 0);
+  assert.equal(calls.bumpMaxPropertyId.length, 0);
+});
+
+test('mapping audit controller returns 502 when KiteProp fails', async () => {
+  const error = new Error('KiteProp unavailable');
+  error.status = 503;
+  installStrapiMock({ properties: { 101: error } });
+  const controller = loadController();
+  const ctx = { query: { kitepropId: '101' }, status: 200, body: null };
+
+  await controller.mappingAudit(ctx);
+
+  assert.equal(ctx.status, 502);
+  assert.equal(ctx.body.ok, false);
+  assert.equal(ctx.body.read_only, true);
+});
+
+test('mapping audit controller returns 500 when Strapi fails', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    existingProperty: null,
+    localProperties: {},
+    kitepropImageFindManyError: new Error('database unavailable'),
+  });
+  global.strapi.documents = (uid) => {
+    if (uid === PROPIEDAD_UID) {
+      return { async findFirst() { throw new Error('database unavailable'); } };
+    }
+    throw new Error(`Unexpected uid ${uid}`);
+  };
+  const controller = loadController();
+  const ctx = { query: { kitepropId: '101' }, status: 200, body: null };
+
+  await controller.mappingAudit(ctx);
+
+  assert.equal(ctx.status, 500);
+  assert.equal(ctx.body.ok, false);
+  assert.equal(ctx.body.read_only, true);
 });

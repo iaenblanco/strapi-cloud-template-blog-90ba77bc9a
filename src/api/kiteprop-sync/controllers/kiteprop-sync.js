@@ -14,6 +14,7 @@
  *   POST   /kiteprop-sync/properties/run-all       (delta + sniffer in one call)
  *   POST   /kiteprop-sync/properties/run-next      (one changed/new property)
  *   GET    /kiteprop-sync/reconciliation/summary   (read-only ID audit)
+ *   GET    /kiteprop-sync/reconciliation/mapping-audit (read-only mapping audit)
  *   GET    /kiteprop-sync/state                    (read sync-state)
  *
  * Dry-run is controlled by:
@@ -61,6 +62,20 @@ function parseReconciliationQuery(query = {}) {
     includeSamples: parseBoolean(query.includeSamples, true),
     sampleSize: parsePositiveInt(query.sampleSize, 20, { max: 1000 }),
     order,
+  };
+}
+
+function parseMappingAuditQuery(query = {}) {
+  return {
+    status: typeof query.status === 'string' && query.status.trim() ? query.status.trim() : 'active',
+    kitepropId: query.kitepropId ? Number(query.kitepropId) : null,
+    limit: parseKitePropLimit(query.limit),
+    maxPages: parsePositiveInt(query.maxPages, 20, { max: 1000 }),
+    includeDetails: parseBoolean(query.includeDetails, true),
+    includeRawSample: parseBoolean(query.includeRawSample, false),
+    sampleSize: parsePositiveInt(query.sampleSize, 20, { max: 1000 }),
+    checkImages: parseBoolean(query.checkImages, true),
+    checkFrontRisk: parseBoolean(query.checkFrontRisk, true),
   };
 }
 
@@ -218,6 +233,38 @@ module.exports = {
       ctx.body = await reconciliation.summary(parseReconciliationQuery(ctx.query));
     } catch (err) {
       if (err.source === 'kiteprop') {
+        ctx.status = 502;
+        ctx.body = {
+          ok: false,
+          read_only: true,
+          error: {
+            message: err.message,
+            status: err.status || null,
+          },
+        };
+        return;
+      }
+
+      ctx.status = 500;
+      ctx.body = {
+        ok: false,
+        read_only: true,
+        error: {
+          message: err.message,
+        },
+      };
+    }
+  },
+
+  /**
+   * Read-only mapping audit from KiteProp payload to Strapi fields and frontend risk.
+   */
+  async mappingAudit(ctx) {
+    const mappingAudit = strapi.service('api::kiteprop-sync.mapping-audit');
+    try {
+      ctx.body = await mappingAudit.audit(parseMappingAuditQuery(ctx.query));
+    } catch (err) {
+      if (err.source === 'kiteprop' || err.status) {
         ctx.status = 502;
         ctx.body = {
           ok: false,

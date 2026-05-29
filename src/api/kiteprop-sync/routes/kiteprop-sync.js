@@ -34,6 +34,12 @@ module.exports = {
       config: { policies: policy, auth: false },
     },
     {
+      method: 'GET',
+      path: '/kiteprop-sync/reconciliation/mapping-audit',
+      handler: 'kiteprop-sync.mappingAudit',
+      config: { policies: policy, auth: false },
+    },
+    {
       method: 'POST',
       path: '/kiteprop-sync/properties/run-delta',
       handler: 'kiteprop-sync.runDelta',
