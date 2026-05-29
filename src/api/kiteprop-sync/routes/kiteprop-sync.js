@@ -28,6 +28,12 @@ module.exports = {
       config: { policies: policy, auth: false },
     },
     {
+      method: 'GET',
+      path: '/kiteprop-sync/reconciliation/summary',
+      handler: 'kiteprop-sync.reconciliationSummary',
+      config: { policies: policy, auth: false },
+    },
+    {
       method: 'POST',
       path: '/kiteprop-sync/properties/run-delta',
       handler: 'kiteprop-sync.runDelta',

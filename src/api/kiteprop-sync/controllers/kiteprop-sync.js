@@ -13,6 +13,7 @@
  *   POST   /kiteprop-sync/properties/run-sniffer   (id-desc sniffer for new entries)
  *   POST   /kiteprop-sync/properties/run-all       (delta + sniffer in one call)
  *   POST   /kiteprop-sync/properties/run-next      (one changed/new property)
+ *   GET    /kiteprop-sync/reconciliation/summary   (read-only ID audit)
  *   GET    /kiteprop-sync/state                    (read sync-state)
  *
  * Dry-run is controlled by:
@@ -25,6 +26,42 @@ function resolveDryRun(ctx) {
   if (typeof body.dryRun === 'boolean') return body.dryRun;
   if (typeof body.dry_run === 'boolean') return body.dry_run;
   return String(process.env.KITEPROP_SYNC_DRY_RUN || 'true').toLowerCase() === 'true';
+}
+
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'y'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'n'].includes(normalized)) return false;
+  return fallback;
+}
+
+function parsePositiveInt(value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+function parseKitePropLimit(value) {
+  const parsed = parsePositiveInt(value, 50, { max: 50 });
+  return [15, 30, 50].includes(parsed) ? parsed : 50;
+}
+
+function parseReconciliationQuery(query = {}) {
+  const allowedOrders = new Set(['id:asc', 'id:desc', 'price:asc', 'price:desc']);
+  const order = allowedOrders.has(query.order) ? query.order : 'id:desc';
+
+  return {
+    status: typeof query.status === 'string' && query.status.trim() ? query.status.trim() : 'active',
+    // KiteProp docs for Properties - List allow only 15, 30, and 50; 50 is the maximum documented value.
+    limit: parseKitePropLimit(query.limit),
+    maxPages: parsePositiveInt(query.maxPages, 20, { max: 1000 }),
+    includeIds: parseBoolean(query.includeIds, true),
+    includeSamples: parseBoolean(query.includeSamples, true),
+    sampleSize: parsePositiveInt(query.sampleSize, 20, { max: 1000 }),
+    order,
+  };
 }
 
 module.exports = {
@@ -170,5 +207,37 @@ module.exports = {
     const state = strapi.service('api::kiteprop-sync.state');
     const current = await state.read();
     ctx.body = { ok: true, state: current };
+  },
+
+  /**
+   * Read-only reconciliation between active KiteProp IDs and local kiteprop_id values.
+   */
+  async reconciliationSummary(ctx) {
+    const reconciliation = strapi.service('api::kiteprop-sync.reconciliation');
+    try {
+      ctx.body = await reconciliation.summary(parseReconciliationQuery(ctx.query));
+    } catch (err) {
+      if (err.source === 'kiteprop') {
+        ctx.status = 502;
+        ctx.body = {
+          ok: false,
+          read_only: true,
+          error: {
+            message: err.message,
+            status: err.status || null,
+          },
+        };
+        return;
+      }
+
+      ctx.status = 500;
+      ctx.body = {
+        ok: false,
+        read_only: true,
+        error: {
+          message: err.message,
+        },
+      };
+    }
   },
 };
