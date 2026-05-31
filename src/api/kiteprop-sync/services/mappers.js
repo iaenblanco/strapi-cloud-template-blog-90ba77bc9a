@@ -60,7 +60,7 @@ function mapObjetivo(remote) {
   return null;
 }
 
-function mapPrecio(remote) {
+function getPrimaryPrice(remote) {
   if (remote.for_sale && remote.for_sale_price != null) return Math.round(Number(remote.for_sale_price));
   if (remote.for_rent && remote.for_rent_price != null) return Math.round(Number(remote.for_rent_price));
   if (remote.for_temp_rental && remote.for_temp_rental_price_month != null) {
@@ -69,10 +69,16 @@ function mapPrecio(remote) {
   return null;
 }
 
+function mapPrecio(remote) {
+  const currency = String(remote.currency || '').toLowerCase();
+  if (currency !== 'uf') return null;
+  return getPrimaryPrice(remote);
+}
+
 function mapPrecioCLP(remote) {
   const currency = String(remote.currency || '').toLowerCase();
   if (currency !== 'clp') return null;
-  const p = mapPrecio(remote);
+  const p = getPrimaryPrice(remote);
   return p != null ? Math.round(p) : null;
 }
 
@@ -298,6 +304,7 @@ module.exports = {
   TYPE_MAP,
   mapTipo,
   mapObjetivo,
+  getPrimaryPrice,
   mapPrecio,
   mapPrecioCLP,
   mapKitepropImagenes,

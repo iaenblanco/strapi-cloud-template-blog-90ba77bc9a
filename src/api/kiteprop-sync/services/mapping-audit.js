@@ -157,6 +157,10 @@ function buildFrontRisk(kp, strapiProperty, enabled) {
   return risk;
 }
 
+function hasRemotePrimaryPrice(kp) {
+  return mappers.getPrimaryPrice(kp) !== null;
+}
+
 module.exports = ({ strapi: _strapi } = {}) => {
   const app = () => _strapi || strapi;
   const client = () => app().service('api::kiteprop-sync.client');
@@ -309,16 +313,22 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
     if (currency === 'clp' && toIntOrNull(local?.Precio)) {
       issues.push(issue(
-        'front_clp_price_rendered_as_uf',
-        options.checkFrontRisk ? 'critical' : 'warning',
-        'Property currency is CLP but Strapi Precio is filled; current frontend treats Precio as UF.'
+        'precio_field_assignment_mismatch',
+        'critical',
+        'currency=clp must map only to Precio_CLP; Precio must be null.'
       ));
     }
     if (currency === 'clp' && toIntOrNull(local?.Precio_CLP) === null) {
-      issues.push(issue('missing_precio_clp', 'error', 'currency=clp requires Precio_CLP according to current mapper.'));
+      issues.push(issue('missing_precio_clp', 'error', 'currency=clp requires Precio_CLP; Precio must remain null.'));
     }
-    if (currency && currency !== 'clp' && toIntOrNull(local?.Precio_CLP) !== null) {
-      issues.push(issue('unexpected_precio_clp', 'warning', 'Precio_CLP is filled for a non-CLP KiteProp currency.'));
+    if (currency === 'uf' && toIntOrNull(local?.Precio) === null) {
+      issues.push(issue('missing_precio_uf', 'error', 'currency=uf requires Precio; Precio_CLP must remain null.'));
+    }
+    if (currency === 'uf' && toIntOrNull(local?.Precio_CLP) !== null) {
+      issues.push(issue('unexpected_precio_clp_for_uf', 'error', 'currency=uf must map only to Precio; Precio_CLP must be null.'));
+    }
+    if (currency && !['uf', 'clp'].includes(currency) && hasRemotePrimaryPrice(kp)) {
+      issues.push(issue('unknown_currency_price_not_mapped', 'warning', 'KiteProp currency is unknown; remote price was intentionally not mapped.'));
     }
     if (!sameNumber(local?.Precio, expected.Precio)) {
       issues.push(issue('precio_mismatch', 'critical', 'Strapi Precio differs from current mapper output.'));
@@ -326,7 +336,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     if (!sameNumber(local?.Precio_CLP, expected.Precio_CLP)) {
       issues.push(issue('precio_clp_mismatch', 'error', 'Strapi Precio_CLP differs from current mapper output.'));
     }
-    if ((kp.for_sale || kp.for_rent || kp.for_temp_rental) && expected.Precio === null) {
+    if ((kp.for_sale || kp.for_rent || kp.for_temp_rental) && expected.Precio === null && expected.Precio_CLP === null) {
       issues.push(issue('missing_commercial_price', 'warning', 'Property has an operation flag but no mapped price.'));
     }
 
@@ -723,7 +733,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       status: checks.price.front_risk.risk === 'high' ? 'critical' : 'ok',
       front_risk: checks.price.front_risk,
       issues: checks.price.front_risk.risk === 'high'
-        ? [issue('front_clp_price_rendered_as_uf', 'critical', 'Frontend would render CLP Precio as UF.')]
+        ? [issue('precio_field_assignment_mismatch', 'critical', 'Frontend risk is caused by CLP stored in Precio instead of only Precio_CLP.')]
         : [],
     };
 

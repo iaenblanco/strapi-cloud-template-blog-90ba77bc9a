@@ -310,6 +310,51 @@ test.beforeEach(() => {
   process.env.KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY = '12';
 });
 
+test('mapper assigns UF sale price only to Precio', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ currency: 'uf', for_sale_price: 8096 }));
+
+  assert.equal(payload.Precio, 8096);
+  assert.equal(payload.Precio_CLP, null);
+});
+
+test('mapper assigns CLP sale price only to Precio_CLP', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ currency: 'clp', for_sale_price: 27000000 }));
+
+  assert.equal(payload.Precio, null);
+  assert.equal(payload.Precio_CLP, 27000000);
+});
+
+test('mapper assigns CLP rent price only to Precio_CLP', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({
+    currency: 'clp',
+    for_sale: false,
+    for_rent: true,
+    for_rent_price: 500000,
+  }));
+
+  assert.equal(payload.Precio, null);
+  assert.equal(payload.Precio_CLP, 500000);
+});
+
+test('mapper assigns UF rent price only to Precio', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({
+    currency: 'uf',
+    for_sale: false,
+    for_rent: true,
+    for_rent_price: 20,
+  }));
+
+  assert.equal(payload.Precio, 20);
+  assert.equal(payload.Precio_CLP, null);
+});
+
+test('mapper leaves prices empty for unknown currency', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ currency: 'usd', for_sale_price: 1000 }));
+
+  assert.equal(payload.Precio, null);
+  assert.equal(payload.Precio_CLP, null);
+});
+
 test('does not create a duplicate property when kiteprop_id already exists', async () => {
   process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
   const kp = sampleProperty({ title: 'Updated title' });
@@ -729,18 +774,20 @@ test('reconciliation health is true when ID sets match and there are no duplicat
   assert.deepEqual(result.strapi.status_summary, { active: 2 });
 });
 
-test('mapping audit detects currency=clp with Precio filled as frontend risk', async () => {
+test('mapping audit detects legacy CLP property with Precio filled as backend assignment mismatch', async () => {
   const kp = sampleProperty({ currency: 'clp', for_sale_price: 120000000 });
   installStrapiMock({
     properties: { 101: kp },
-    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Precio: 120000000, Precio_CLP: 120000000 }) },
     kitepropImageRows: kitepropImageRowsFor(kp),
   });
   const result = await loadMappingAuditService().audit({ kitepropId: 101 });
 
   assert.equal(result.properties[0].checks.price.front_risk.risk, 'high');
   assert.equal(result.properties[0].checks.price.status, 'critical');
-  assert.ok(result.properties[0].issues.some((item) => item.code === 'front_clp_price_rendered_as_uf'));
+  assert.equal(result.properties[0].checks.price.expected.Precio, null);
+  assert.equal(result.properties[0].checks.price.expected.Precio_CLP, 120000000);
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'precio_field_assignment_mismatch'));
 });
 
 test('mapping audit detects Precio mismatch', async () => {
@@ -766,6 +813,20 @@ test('mapping audit detects missing Precio_CLP for CLP currency', async () => {
   const result = await loadMappingAuditService().audit({ kitepropId: 101, checkFrontRisk: false });
 
   assert.ok(result.properties[0].issues.some((item) => item.code === 'missing_precio_clp'));
+});
+
+test('mapping audit warns when unknown currency price is intentionally not mapped', async () => {
+  const kp = sampleProperty({ currency: 'usd', for_sale_price: 120000000 });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.equal(result.properties[0].checks.price.expected.Precio, null);
+  assert.equal(result.properties[0].checks.price.expected.Precio_CLP, null);
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'unknown_currency_price_not_mapped'));
 });
 
 test('mapping audit detects incorrect Objetivo', async () => {
