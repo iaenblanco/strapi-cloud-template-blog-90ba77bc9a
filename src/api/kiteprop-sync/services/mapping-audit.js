@@ -139,6 +139,38 @@ function imageMappingFileId(mapping) {
   return mapping?.file?.id || mapping?.file?.attributes?.id || null;
 }
 
+function imageMappingRemoteId(mapping) {
+  return mapping?.remote_image_id === null || mapping?.remote_image_id === undefined
+    ? null
+    : String(mapping.remote_image_id);
+}
+
+function sameArray(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sampleList(values, size = 5) {
+  return values.slice(0, size);
+}
+
+function rawImageSignature(image) {
+  return {
+    id: image?.id === null || image?.id === undefined ? null : String(image.id),
+    main: !!image?.main,
+    position: image?.position ?? null,
+    url: hashes.normalizeUrl(imageHelpers.pickImageUrl(image)),
+  };
+}
+
+function normalizedJsonSignature(image) {
+  return {
+    image_key: image?.image_key || null,
+    remote_image_id: image?.remote_image_id === null || image?.remote_image_id === undefined ? null : String(image.remote_image_id),
+    remote_url_hash: image?.remote_url_hash || null,
+    order: image?.order ?? null,
+  };
+}
+
 function buildFrontRisk(kp, strapiProperty, enabled) {
   const price = toIntOrNull(strapiProperty?.Precio);
   const currency = String(kp?.currency || '').toLowerCase();
@@ -642,29 +674,69 @@ module.exports = ({ strapi: _strapi } = {}) => {
     }
 
     if (localJsonImages.length > 0) {
-      const localJsonKeys = localJsonImages.map((image) => image.image_key);
-      if (JSON.stringify(localJsonKeys) !== JSON.stringify(normalizedKeys)) {
-        issues.push(issue('image_order_mismatch', 'error', 'Propiedad.kiteprop_imagenes order differs from normalized images.'));
-      }
-      for (const image of normalizedImages) {
-        const localJson = localJsonImages.find((item) => item.image_key === image.image_key);
-        if (localJson && localJson.remote_url_hash !== image.remote_url_hash) {
-          issues.push(issue('remote_url_hash_mismatch', 'error', 'Propiedad.kiteprop_imagenes remote_url_hash differs from normalized image.', { image_key: image.image_key }));
+      const jsonHasNormalizedShape = localJsonImages.some((image) => image?.image_key || image?.remote_url_hash);
+      if (jsonHasNormalizedShape) {
+        const localJsonNormalized = localJsonImages.map(normalizedJsonSignature);
+        const expectedJsonNormalized = normalizedImages.map(normalizedJsonSignature);
+        if (!sameArray(localJsonNormalized, expectedJsonNormalized)) {
+          issues.push(issue('kiteprop_imagenes_json_mismatch', 'warning', 'Propiedad.kiteprop_imagenes normalized JSON differs from normalized KiteProp images.'));
+        }
+      } else {
+        const localJsonRaw = localJsonImages.map(rawImageSignature);
+        const expectedJsonRaw = mappers.mapKitepropImagenes(remoteImages).map(rawImageSignature);
+        if (!sameArray(localJsonRaw, expectedJsonRaw)) {
+          issues.push(issue('kiteprop_imagenes_json_mismatch', 'warning', 'Propiedad.kiteprop_imagenes raw JSON differs from mapKitepropImagenes output.'));
         }
       }
     }
 
     const expectedFileIds = normalizedImages
-      .map((image) => imageMappingFileId(mappingByKey.get(image.image_key)))
-      .filter(Boolean);
+      .map((image) => imageMappingFileId(mappingByKey.get(image.image_key)));
     const localFileIds = localImages.map(mediaId).filter(Boolean);
-    if (expectedFileIds.length && JSON.stringify(localFileIds.slice(0, expectedFileIds.length)) !== JSON.stringify(expectedFileIds)) {
-      issues.push(issue('image_order_mismatch', 'error', 'Propiedad.Imagenes media order differs from KiteProp Image mappings.'));
+    const completeExpectedFileIds = expectedFileIds.length === normalizedImages.length && expectedFileIds.every(Boolean);
+    const expectedFileIdsForCompare = expectedFileIds.filter(Boolean);
+
+    if (
+      completeExpectedFileIds &&
+      localFileIds.length >= expectedFileIdsForCompare.length &&
+      !sameArray(localFileIds.slice(0, expectedFileIdsForCompare.length), expectedFileIdsForCompare)
+    ) {
+      issues.push(issue('media_order_mismatch', 'error', 'Propiedad.Imagenes media order differs from normalized KiteProp image mappings.'));
     }
 
-    if (expectedFileIds.length && localFileIds.length && expectedFileIds[0] !== localFileIds[0]) {
+    if (expectedFileIdsForCompare.length && localFileIds.length && expectedFileIdsForCompare[0] !== localFileIds[0]) {
       issues.push(issue('first_image_mismatch', 'critical', 'First Strapi media file does not match first normalized KiteProp image.'));
     }
+
+    const mappingsInStoredOrder = [...mappings].sort((a, b) => {
+      const ao = Number.isFinite(Number(a?.order)) ? Number(a.order) : Number.MAX_SAFE_INTEGER;
+      const bo = Number.isFinite(Number(b?.order)) ? Number(b.order) : Number.MAX_SAFE_INTEGER;
+      if (ao !== bo) return ao - bo;
+      return String(a?.id || '').localeCompare(String(b?.id || ''));
+    });
+    const mappingRemoteIdsInOrder = mappingsInStoredOrder
+      .filter((mapping) => normalizedKeySet.has(mapping.image_key))
+      .map(imageMappingRemoteId);
+    const expectedRemoteIdsInOrder = normalizedImages.map((image) => image.remote_image_id);
+    if (
+      mappingRemoteIdsInOrder.length === expectedRemoteIdsInOrder.length &&
+      !sameArray(mappingRemoteIdsInOrder, expectedRemoteIdsInOrder)
+    ) {
+      issues.push(issue('kiteprop_image_mapping_order_mismatch', 'error', 'KiteProp Image mapping order differs from normalized KiteProp images.'));
+    }
+
+    const mappingByFileId = new Map();
+    for (const mapping of mappings) {
+      const fileId = imageMappingFileId(mapping);
+      if (fileId) mappingByFileId.set(String(fileId), mapping);
+    }
+    const actualImageKeys = localFileIds.map((fileId) => mappingByFileId.get(String(fileId))?.image_key || null);
+    const actualRemoteIds = localFileIds.map((fileId) => imageMappingRemoteId(mappingByFileId.get(String(fileId))));
+    const comparisonBasis = completeExpectedFileIds
+      ? 'media_mapping'
+      : localJsonImages.length > 0
+        ? 'kiteprop_imagenes_json'
+        : 'unknown';
 
     const mainRemote = remoteImages.find((image) => image?.main);
     if (mainRemote && normalizedImages[0]?.remote_image_id && String(mainRemote.id) !== String(normalizedImages[0].remote_image_id)) {
@@ -678,12 +750,17 @@ module.exports = ({ strapi: _strapi } = {}) => {
         main_remote_image_id: mainRemote?.id ?? null,
         normalized_count: normalizedImages.length,
         normalized_first_image_key: normalizedImages[0]?.image_key || null,
+        expected_first_image_key: normalizedImages[0]?.image_key || null,
+        expected_remote_image_ids_sample: sampleList(expectedRemoteIdsInOrder),
       },
       strapi: {
         imagenes_count: localImages.length,
         kiteprop_image_mapping_count: mappings.length,
         first_media_id: localFileIds[0] || null,
         first_media_url: mediaUrl(localImages[0]),
+        actual_first_image_key: actualImageKeys[0] || null,
+        actual_remote_image_ids_sample: sampleList(actualRemoteIds),
+        comparison_basis: comparisonBasis,
       },
       issues,
     };

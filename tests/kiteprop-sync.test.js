@@ -996,7 +996,29 @@ test('mapping audit detects image_count_mismatch', async () => {
   assert.ok(result.properties[0].issues.some((item) => item.code === 'image_count_mismatch'));
 });
 
-test('mapping audit detects first_image_mismatch', async () => {
+test('mapping audit does not mark image order mismatch when legacy kiteprop_imagenes lacks image_key but media mapping matches', async () => {
+  const kp = sampleProperty();
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp, {
+        kiteprop_imagenes: mappers.mapKitepropImagenes(kp.images_list),
+      }),
+    },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+  const issues = result.properties[0].issues.map((item) => item.code);
+
+  assert.equal(result.properties[0].checks.images.strapi.comparison_basis, 'media_mapping');
+  assert.equal(result.properties[0].checks.images.kiteprop.expected_first_image_key, '101:11');
+  assert.equal(result.properties[0].checks.images.strapi.actual_first_image_key, '101:11');
+  assert.ok(!issues.includes('image_order_mismatch'));
+  assert.ok(!issues.includes('media_order_mismatch'));
+  assert.ok(!issues.includes('kiteprop_imagenes_json_mismatch'));
+});
+
+test('mapping audit detects media_order_mismatch and first_image_mismatch', async () => {
   const kp = sampleProperty();
   installStrapiMock({
     properties: { 101: kp },
@@ -1012,6 +1034,7 @@ test('mapping audit detects first_image_mismatch', async () => {
   });
   const result = await loadMappingAuditService().audit({ kitepropId: 101 });
 
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'media_order_mismatch'));
   assert.ok(result.properties[0].issues.some((item) => item.code === 'first_image_mismatch'));
 });
 
