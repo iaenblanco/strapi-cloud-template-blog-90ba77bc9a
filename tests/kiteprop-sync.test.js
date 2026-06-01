@@ -355,6 +355,93 @@ test('mapper leaves prices empty for unknown currency', () => {
   assert.equal(payload.Precio_CLP, null);
 });
 
+test('slug helper includes kiteprop_id and normalizes accents and symbols', () => {
+  const slug = mappers.buildKitepropSlug(
+    'Oportunidad de Inversión: Depto 1D/1B en Estación Central',
+    510853
+  );
+
+  assert.equal(slug, 'oportunidad-de-inversion-depto-1d-1b-en-estacion-central-510853');
+});
+
+test('generates Slug when creating a new KiteProp property', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp = sampleProperty({
+    id: 510853,
+    title: 'Oportunidad de Inversión: Depto 1D/1B en Estación Central',
+  });
+  const calls = installStrapiMock();
+  const service = loadService();
+
+  const result = await service._internal.upsertProperty(kp, {
+    runId: 'run-test',
+    source: 'test',
+    dryRun: false,
+  });
+
+  assert.equal(result.action, 'create');
+  assert.equal(calls.propertyCreates.length, 1);
+  assert.equal(
+    calls.propertyCreates[0].Slug,
+    'oportunidad-de-inversion-depto-1d-1b-en-estacion-central-510853'
+  );
+});
+
+test('generates Slug when updating an existing KiteProp property with empty Slug', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp = sampleProperty({ id: 510853, title: 'Casa Ñuñoa / Metro' });
+  const { dataHash, imagesHash } = computedHashes(kp);
+  const calls = installStrapiMock({
+    existingProperty: {
+      documentId: 'prop-510853',
+      Slug: '',
+      kiteprop_id: 510853,
+      kiteprop_updated_at: kp.updated_at,
+      kiteprop_data_hash: dataHash,
+      kiteprop_images_hash: imagesHash,
+      Imagenes: [],
+    },
+  });
+  const service = loadService();
+
+  const result = await service._internal.upsertProperty(kp, {
+    runId: 'run-test',
+    source: 'test',
+    dryRun: false,
+  });
+
+  assert.equal(result.action, 'update');
+  assert.equal(calls.propertyUpdates.length, 1);
+  assert.equal(calls.propertyUpdates[0].data.Slug, 'casa-nunoa-metro-510853');
+});
+
+test('does not overwrite an existing Slug when updating a KiteProp property', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp = sampleProperty({ id: 510853, title: 'Nuevo titulo remoto' });
+  const calls = installStrapiMock({
+    existingProperty: {
+      documentId: 'prop-510853',
+      Slug: 'slug-manual',
+      kiteprop_id: 510853,
+      kiteprop_updated_at: '2026-04-01T10:00:00.000000Z',
+      kiteprop_data_hash: 'old',
+      kiteprop_images_hash: 'old',
+      Imagenes: [],
+    },
+  });
+  const service = loadService();
+
+  const result = await service._internal.upsertProperty(kp, {
+    runId: 'run-test',
+    source: 'test',
+    dryRun: false,
+  });
+
+  assert.equal(result.action, 'update');
+  assert.equal(calls.propertyUpdates.length, 1);
+  assert.equal(calls.propertyUpdates[0].data.Slug, undefined);
+});
+
 test('does not create a duplicate property when kiteprop_id already exists', async () => {
   process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
   const kp = sampleProperty({ title: 'Updated title' });
@@ -385,6 +472,7 @@ test('does not upload images when images_hash is unchanged', async () => {
   const calls = installStrapiMock({
     existingProperty: {
       documentId: 'prop-1',
+      Slug: mappers.buildKitepropSlug(kp.title, kp.id),
       kiteprop_id: 101,
       kiteprop_updated_at: kp.updated_at,
       kiteprop_data_hash: dataHash,
@@ -412,6 +500,7 @@ test('reuses an existing image mapping by image_key', async () => {
   const calls = installStrapiMock({
     existingProperty: {
       documentId: 'prop-1',
+      Slug: mappers.buildKitepropSlug(kp.title, kp.id),
       kiteprop_id: 101,
       kiteprop_updated_at: kp.updated_at,
       kiteprop_data_hash: dataHash,
@@ -453,6 +542,7 @@ test('reorders images without re-uploading existing files', async () => {
   const calls = installStrapiMock({
     existingProperty: {
       documentId: 'prop-1',
+      Slug: mappers.buildKitepropSlug(kp.title, kp.id),
       kiteprop_id: 101,
       kiteprop_updated_at: kp.updated_at,
       kiteprop_data_hash: dataHash,
@@ -494,6 +584,7 @@ test('does not save images_hash when an image import fails', async () => {
   const calls = installStrapiMock({
     existingProperty: {
       documentId: 'prop-1',
+      Slug: mappers.buildKitepropSlug(kp.title, kp.id),
       kiteprop_id: 101,
       kiteprop_updated_at: kp.updated_at,
       kiteprop_data_hash: dataHash,
@@ -827,6 +918,19 @@ test('mapping audit warns when unknown currency price is intentionally not mappe
   assert.equal(result.properties[0].checks.price.expected.Precio, null);
   assert.equal(result.properties[0].checks.price.expected.Precio_CLP, null);
   assert.ok(result.properties[0].issues.some((item) => item.code === 'unknown_currency_price_not_mapped'));
+});
+
+test('mapping audit does not mark missing_slug when Slug exists', async () => {
+  const kp = sampleProperty({ title: 'Casa con Slug' });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Slug: 'slug-manual-o-generado' }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.equal(result.properties[0].checks.title_slug.expected.Slug, 'slug-manual-o-generado');
+  assert.ok(!result.properties[0].issues.some((item) => item.code === 'missing_slug'));
 });
 
 test('mapping audit detects incorrect Objetivo', async () => {

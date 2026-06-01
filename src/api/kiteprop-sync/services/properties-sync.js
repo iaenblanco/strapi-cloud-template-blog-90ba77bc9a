@@ -88,6 +88,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       fields: [
         'id',
         'documentId',
+        'Slug',
         'kiteprop_id',
         'kiteprop_updated_at',
         'kiteprop_status',
@@ -465,8 +466,12 @@ module.exports = ({ strapi: _strapi } = {}) => {
       dry_run: dryRun,
     });
 
+    const existingHasSlug = !!String(existing?.Slug || '').trim();
+    const shouldWriteGeneratedSlug = !!payload.Slug && (!existing || !existingHasSlug);
+
     const dataChanged =
       !existing ||
+      shouldWriteGeneratedSlug ||
       existing.kiteprop_data_hash !== remoteDataHash ||
       mappers.isRemoteNewer(payload.kiteprop_updated_at, existing.kiteprop_updated_at);
     const imageHashChanged = !existing || existing.kiteprop_images_hash !== remoteImagesHash;
@@ -559,7 +564,10 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
     const writePayload = {};
     if (dataChanged) {
-      Object.assign(writePayload, payload, {
+      const dataPayload = { ...payload };
+      if (existingHasSlug) delete dataPayload.Slug;
+
+      Object.assign(writePayload, dataPayload, {
         kiteprop_data_hash: remoteDataHash,
         kiteprop_last_synced_at: new Date().toISOString(),
         kiteprop_synced_at: new Date().toISOString(),

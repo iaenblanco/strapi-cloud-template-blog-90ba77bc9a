@@ -515,7 +515,10 @@ module.exports = ({ strapi: _strapi } = {}) => {
       status: maxStatus(issues.map((item) => item.severity)),
       kiteprop: { title: kp.title ?? null },
       strapi: { Titulo: local?.Titulo ?? null, Slug: local?.Slug ?? null },
-      expected: { Titulo: expected.Titulo ?? null },
+      expected: {
+        Titulo: expected.Titulo ?? null,
+        Slug: local?.Slug || expected.Slug || null,
+      },
       issues,
     };
   }

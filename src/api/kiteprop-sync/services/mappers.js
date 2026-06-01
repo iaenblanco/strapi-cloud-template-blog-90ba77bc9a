@@ -43,6 +43,8 @@ const TYPE_MAP = {
   boat_storages: 'Otros Inmuebles',
 };
 
+const MAX_SLUG_BASE_LENGTH = 90;
+
 function mapTipo(kpType) {
   if (!kpType) return null;
   return TYPE_MAP[String(kpType).toLowerCase()] || 'Otros Inmuebles';
@@ -80,6 +82,28 @@ function mapPrecioCLP(remote) {
   if (currency !== 'clp') return null;
   const p = getPrimaryPrice(remote);
   return p != null ? Math.round(p) : null;
+}
+
+function slugify(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function buildKitepropSlug(title, kitepropId) {
+  const id = String(kitepropId || '').trim();
+  if (!id) return null;
+
+  const base = slugify(title) || 'propiedad';
+  const trimmedBase = base
+    .slice(0, MAX_SLUG_BASE_LENGTH)
+    .replace(/-+$/g, '');
+
+  return `${trimmedBase || 'propiedad'}-${id}`;
 }
 
 function toIntOrNull(v) {
@@ -228,6 +252,7 @@ function mapPropertyToStrapi(kp) {
 
     // Mapped business fields (only set when KiteProp provides them)
     Titulo: kp.title ?? null,
+    Slug: buildKitepropSlug(kp.title, kp.id),
     Descripcion: kp.description ?? null,
     Tipo: tipo ?? undefined,
     Objetivo: objetivo ?? undefined,
@@ -307,6 +332,8 @@ module.exports = {
   getPrimaryPrice,
   mapPrecio,
   mapPrecioCLP,
+  slugify,
+  buildKitepropSlug,
   mapKitepropImagenes,
   mapDestacado,
   mapOportunidades,
