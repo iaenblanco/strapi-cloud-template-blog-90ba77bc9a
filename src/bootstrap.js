@@ -35,8 +35,7 @@ function startKitepropSyncInterval() {
     const dryRun = isKitepropDryRunDefault();
     try {
       const sync = strapi.service('api::kiteprop-sync.properties-sync');
-      await sync.runDelta({ source: 'interval:delta', dryRun, maxPages, maxItems });
-      await sync.runSniffer({ source: 'interval:sniffer', dryRun, maxPages, maxItems });
+      await sync.runInterval({ source: 'interval', dryRun, maxPages, maxItems });
     } catch (err) {
       strapi.log.error(`[kiteprop-sync][interval] failed: ${err.message}`);
     }

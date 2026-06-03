@@ -9,6 +9,7 @@ const imageHelpers = require('../src/api/kiteprop-sync/services/images');
 
 const PROPIEDAD_UID = 'api::propiedad.propiedad';
 const KITEPROP_IMAGE_UID = 'api::kiteprop-image.kiteprop-image';
+const originalFetch = global.fetch;
 
 function sampleProperty(overrides = {}) {
   return {
@@ -66,6 +67,11 @@ function loadReconciliationService() {
 function loadMappingAuditService() {
   delete require.cache[require.resolve('../src/api/kiteprop-sync/services/mapping-audit')];
   return require('../src/api/kiteprop-sync/services/mapping-audit')({});
+}
+
+function loadFrontendDeployService() {
+  delete require.cache[require.resolve('../src/api/kiteprop-sync/services/frontend-deploy')];
+  return require('../src/api/kiteprop-sync/services/frontend-deploy')({});
 }
 
 function loadController() {
@@ -131,6 +137,11 @@ function installStrapiMock(options = {}) {
     findImageFilters: [],
     listProperties: [],
     strapiFindMany: [],
+    storeGets: [],
+    storeSets: [],
+    infoLogs: [],
+    warnLogs: [],
+    errorLogs: [],
   };
 
   let currentProperty = options.existingProperty || null;
@@ -227,8 +238,12 @@ function installStrapiMock(options = {}) {
   };
 
   const strapiRows = options.strapiRows || [];
+  const storeValues = new Map(Object.entries(options.storeValues || {}));
 
   global.strapi = {
+    config: {
+      environment: 'test',
+    },
     contentTypes: {
       [PROPIEDAD_UID]: {
         attributes: {
@@ -292,12 +307,25 @@ function installStrapiMock(options = {}) {
       if (uid === 'api::kiteprop-sync.client') return client;
       if (uid === 'api::kiteprop-sync.reconciliation') return loadReconciliationService();
       if (uid === 'api::kiteprop-sync.mapping-audit') return loadMappingAuditService();
+      if (uid === 'api::kiteprop-sync.frontend-deploy') return loadFrontendDeployService();
       throw new Error(`Unexpected service ${uid}`);
     },
+    store() {
+      return {
+        async get({ key }) {
+          calls.storeGets.push(key);
+          return storeValues.get(key);
+        },
+        async set({ key, value }) {
+          calls.storeSets.push({ key, value });
+          storeValues.set(key, value);
+        },
+      };
+    },
     log: {
-      info() {},
-      warn() {},
-      error() {},
+      info(message) { calls.infoLogs.push(message); },
+      warn(message) { calls.warnLogs.push(message); },
+      error(message) { calls.errorLogs.push(message); },
       debug() {},
     },
   };
@@ -306,8 +334,14 @@ function installStrapiMock(options = {}) {
 }
 
 test.beforeEach(() => {
+  global.fetch = originalFetch;
   process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'true';
   process.env.KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY = '12';
+  delete process.env.FRONTEND_DEPLOY_ENABLED;
+  delete process.env.FRONTEND_DEPLOY_HOOK_URL;
+  delete process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS;
+  delete process.env.FRONTEND_DEPLOY_REASON_LOG;
+  delete process.env.FRONTEND_DEPLOY_TIMEOUT_MS;
 });
 
 test('mapper assigns UF sale price only to Precio', () => {
@@ -672,6 +706,362 @@ test('dryRun does not write properties, image mappings, hashes, or cursors', asy
   assert.equal(calls.imageUpdates.length, 0);
   assert.equal(calls.bumpActivityCursor.length, 0);
   assert.equal(calls.bumpMaxPropertyId.length, 0);
+});
+
+test('frontend deploy does not call hook when disabled', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'false';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'test',
+    source: 'test',
+    runId: 'run-test',
+    changedItems: { created: 1 },
+  });
+
+  assert.equal(result.reason, 'disabled');
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('frontend deploy does not call hook when URL is missing', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'test',
+    source: 'test',
+    runId: 'run-test',
+    changedItems: { created: 1 },
+  });
+
+  assert.equal(result.reason, 'missing_hook_url');
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('frontend deploy does not call hook for dryRun', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    dryRun: true,
+    changedItems: { created: 1 },
+  });
+
+  assert.equal(result.reason, 'dry_run');
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('frontend deploy ignores summaries with only skips/noops', () => {
+  const deploy = loadFrontendDeployService();
+  const decision = deploy.shouldTriggerDeployFromSyncResult({
+    dry_run: false,
+    summary: { created: 0, updated: 0, soft_deleted: 0, errors: 0, skipped: 3 },
+    items: [{ action: 'skip', status: 'noop' }],
+  });
+
+  assert.equal(decision.shouldTrigger, false);
+});
+
+test('frontend deploy ignores noop and skip items', () => {
+  const deploy = loadFrontendDeployService();
+  const decision = deploy.shouldTriggerDeployFromSyncResult({
+    dry_run: false,
+    items: [
+      { action: 'fetch', status: 'ok' },
+      { action: 'skip', status: 'noop' },
+      { action: 'update', status: 'noop' },
+    ],
+  });
+
+  assert.equal(decision.shouldTrigger, false);
+});
+
+test('frontend deploy triggers for created property changes', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'created',
+    source: 'test',
+    runId: 'run-created',
+    changedItems: { created: 1, updated: 0, soft_deleted: 0 },
+  });
+
+  assert.equal(result.triggered, true);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0][1].method, 'POST');
+  assert.ok(calls.storeSets.some((item) => item.key === 'last_frontend_deploy_at'));
+});
+
+test('frontend deploy triggers for updated property changes', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'updated',
+    source: 'test',
+    runId: 'run-updated',
+    changedItems: { updated: 1 },
+  });
+
+  assert.equal(result.triggered, true);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test('frontend deploy triggers for soft-deleted property changes', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'soft delete',
+    source: 'test',
+    runId: 'run-soft-delete',
+    changedItems: { soft_deleted: 1 },
+  });
+
+  assert.equal(result.triggered, true);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test('frontend deploy does not call hook twice inside minimum interval', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS = '600000';
+  installStrapiMock({
+    storeValues: {
+      last_frontend_deploy_at: new Date().toISOString(),
+    },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'debounced',
+    source: 'test',
+    runId: 'run-debounce',
+    changedItems: { created: 1 },
+  });
+
+  assert.equal(result.reason, 'debounce');
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('runDelta keeps sync successful when Cloudflare hook fails', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    activities: [{ id: 50, property_id: 101, type: 'data_changed', created_at: '2026-05-01T00:00:00Z' }],
+    properties: { 101: sampleProperty() },
+  });
+  global.fetch = async () => ({ ok: false, status: 500 });
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-test', dryRun: false, maxPages: 1, maxItems: 1 });
+
+  assert.equal(result.error, null);
+  assert.equal(result.summary.created, 1);
+  assert.equal(calls.bumpActivityCursor.length, 1);
+  assert.ok(calls.errorLogs.some((message) => /Cloudflare deploy hook failed/.test(message)));
+});
+
+test('runDelta alone can trigger frontend deploy', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock({
+    activities: [{ id: 50, property_id: 101, type: 'data_changed', created_at: '2026-05-01T00:00:00Z' }],
+    properties: { 101: sampleProperty() },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-delta-deploy', dryRun: false, maxPages: 1, maxItems: 1 });
+
+  assert.equal(result.summary.created, 1);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test('runSniffer alone can trigger frontend deploy', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock({
+    state: { last_activity_id: 0, last_max_property_id: 100 },
+    propertyList: [{ id: 101 }, { id: 100 }],
+    properties: { 101: sampleProperty({ id: 101 }) },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runSniffer({ runId: 'run-sniffer-deploy', dryRun: false, maxPages: 1, maxItems: 1 });
+
+  assert.equal(result.summary.created, 1);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test('runAll triggers one deploy after delta and sniffer finish', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 0, last_max_property_id: 100 },
+    activities: [{ id: 50, property_id: 101, type: 'data_changed', created_at: '2026-05-01T00:00:00Z' }],
+    propertyList: [{ id: 102 }, { id: 100 }],
+    properties: {
+      101: sampleProperty({ id: 101 }),
+      102: sampleProperty({ id: 102 }),
+    },
+  });
+  const deploySnapshots = [];
+  global.fetch = async (...args) => {
+    deploySnapshots.push({
+      args,
+      propertyCreates: calls.propertyCreates.length,
+      listProperties: calls.listProperties.length,
+    });
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runAll({ runId: 'run-all-deploy', dryRun: false, maxPages: 1, maxItems: 2 });
+
+  assert.equal(result.combined.summary.created, 2);
+  assert.equal(deploySnapshots.length, 1);
+  assert.equal(deploySnapshots[0].propertyCreates, 2);
+  assert.equal(deploySnapshots[0].listProperties, 1);
+});
+
+test('runNext triggers at most one frontend deploy', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock({
+    activities: [{ id: 50, property_id: 101, type: 'data_changed', created_at: '2026-05-01T00:00:00Z' }],
+    properties: { 101: sampleProperty({ id: 101 }) },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runNext({ runId: 'run-next-deploy', dryRun: false, maxPages: 1 });
+
+  assert.equal(result.summary.created, 1);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test('runInterval triggers one deploy after delta and sniffer finish', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 0, last_max_property_id: 100 },
+    activities: [{ id: 50, property_id: 101, type: 'data_changed', created_at: '2026-05-01T00:00:00Z' }],
+    propertyList: [{ id: 102 }, { id: 100 }],
+    properties: {
+      101: sampleProperty({ id: 101 }),
+      102: sampleProperty({ id: 102 }),
+    },
+  });
+  const deploySnapshots = [];
+  global.fetch = async (...args) => {
+    deploySnapshots.push({
+      args,
+      propertyCreates: calls.propertyCreates.length,
+      listProperties: calls.listProperties.length,
+    });
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runInterval({ runId: 'run-interval-deploy', dryRun: false, maxPages: 1, maxItems: 2 });
+
+  assert.equal(result.combined.summary.created, 2);
+  assert.equal(deploySnapshots.length, 1);
+  assert.equal(deploySnapshots[0].propertyCreates, 2);
+  assert.equal(deploySnapshots[0].listProperties, 1);
+});
+
+test('frontend deploy status endpoint does not expose hook URL', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/very-secret';
+  process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS = '12345';
+  installStrapiMock({
+    storeValues: {
+      last_frontend_deploy_at: '2026-06-01T00:00:00.000Z',
+      last_frontend_deploy_reason: 'test reason',
+      last_frontend_deploy_run_id: 'run-status',
+    },
+  });
+  const controller = loadController();
+  const ctx = { status: 200, body: null };
+
+  await controller.frontendDeployStatus(ctx);
+
+  assert.equal(ctx.body.enabled, true);
+  assert.equal(ctx.body.has_hook_url, true);
+  assert.equal(ctx.body.min_interval_ms, 12345);
+  assert.equal(ctx.body.last_frontend_deploy_run_id, 'run-status');
+  assert.equal(JSON.stringify(ctx.body).includes('very-secret'), false);
+});
+
+test('frontend deploy status route is protected by has-trigger-token and auth false', () => {
+  const routes = require('../src/api/kiteprop-sync/routes/kiteprop-sync').routes;
+  const route = routes.find((item) => item.method === 'GET' && item.path === '/kiteprop-sync/frontend-deploy/status');
+
+  assert.ok(route);
+  assert.equal(route.handler, 'kiteprop-sync.frontendDeployStatus');
+  assert.deepEqual(route.config.policies, ['api::kiteprop-sync.has-trigger-token']);
+  assert.equal(route.config.auth, false);
 });
 
 test('reconciliation returns missing_in_strapi when KiteProp has IDs absent locally', async () => {

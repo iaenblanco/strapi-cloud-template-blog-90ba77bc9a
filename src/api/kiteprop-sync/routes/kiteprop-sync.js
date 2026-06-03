@@ -29,6 +29,12 @@ module.exports = {
     },
     {
       method: 'GET',
+      path: '/kiteprop-sync/frontend-deploy/status',
+      handler: 'kiteprop-sync.frontendDeployStatus',
+      config: { policies: policy, auth: false },
+    },
+    {
+      method: 'GET',
       path: '/kiteprop-sync/reconciliation/summary',
       handler: 'kiteprop-sync.reconciliationSummary',
       config: { policies: policy, auth: false },

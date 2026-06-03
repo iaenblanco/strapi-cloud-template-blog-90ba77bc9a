@@ -16,6 +16,7 @@
  *   GET    /kiteprop-sync/reconciliation/summary   (read-only ID audit)
  *   GET    /kiteprop-sync/reconciliation/mapping-audit (read-only mapping audit)
  *   GET    /kiteprop-sync/state                    (read sync-state)
+ *   GET    /kiteprop-sync/frontend-deploy/status   (read deploy debounce/config status)
  *
  * Dry-run is controlled by:
  *   - Body param `dryRun` (true/false), OR
@@ -200,19 +201,13 @@ module.exports = {
     const dryRun = resolveDryRun(ctx);
     const body = ctx.request.body || {};
     const sync = strapi.service('api::kiteprop-sync.properties-sync');
-    const delta = await sync.runDelta({
+    const result = await sync.runAll({
       dryRun,
       source: 'manual:runAll',
       maxPages: body.maxPages ? Number(body.maxPages) : undefined,
       maxItems: body.maxItems ? Number(body.maxItems) : undefined,
     });
-    const sniffer = await sync.runSniffer({
-      dryRun,
-      source: 'manual:runAll',
-      maxPages: body.maxPages ? Number(body.maxPages) : undefined,
-      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
-    });
-    ctx.body = { ok: true, dry_run: dryRun, delta, sniffer };
+    ctx.body = result;
   },
 
   /**
@@ -222,6 +217,14 @@ module.exports = {
     const state = strapi.service('api::kiteprop-sync.state');
     const current = await state.read();
     ctx.body = { ok: true, state: current };
+  },
+
+  /**
+   * Read frontend deploy hook state without exposing the hook URL.
+   */
+  async frontendDeployStatus(ctx) {
+    const deploy = strapi.service('api::kiteprop-sync.frontend-deploy');
+    ctx.body = await deploy.getDeployStatus();
   },
 
   /**

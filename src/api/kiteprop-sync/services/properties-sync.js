@@ -73,6 +73,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
   const imageHelpers = require('./images');
   const state = () => strapi.service('api::kiteprop-sync.state');
   const logger = () => strapi.service('api::kiteprop-sync.logger');
+  const frontendDeploy = () => strapi.service('api::kiteprop-sync.frontend-deploy');
   const docs = () => strapi.documents(PROPIEDAD_UID);
   const imageDocs = () => strapi.documents(KITEPROP_IMAGE_UID);
 
@@ -890,13 +891,21 @@ module.exports = ({ strapi: _strapi } = {}) => {
     }
 
     const result = await upsertProperty(payload, { runId, dryRun, source });
-    return {
+    const syncResult = {
       run_id: runId,
       dry_run: dryRun,
       summary: summarize([result]),
       items: [result],
       duration_ms: Date.now() - startedAt,
     };
+    if (!opts.suppressDeploy) {
+      await maybeTriggerFrontendDeploy(syncResult, {
+        reason: `syncOne property ${id}`,
+        source,
+        runId,
+      });
+    }
+    return syncResult;
   }
 
   /**
@@ -1030,7 +1039,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
           } else {
             // Group changes per property within this run to avoid duplicate fetches.
             if (!propertiesProcessed.has(propertyId) && !deletionsProcessed.has(propertyId)) {
-              const r = await syncOne(propertyId, { runId, dryRun, source });
+              const r = await syncOne(propertyId, { runId, dryRun, source, suppressDeploy: true });
               items.push(...r.items);
               propertiesProcessed.add(propertyId);
               processedThisActivity = true;
@@ -1118,7 +1127,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       duration_ms: Date.now() - startedAt,
     });
 
-    return {
+    const result = {
       run_id: runId,
       dry_run: dryRun,
       summary,
@@ -1128,6 +1137,14 @@ module.exports = ({ strapi: _strapi } = {}) => {
       last_successful_activity_id: lastSuccessfulActivityId,
       duration_ms: Date.now() - startedAt,
     };
+    if (!opts.suppressDeploy) {
+      await maybeTriggerFrontendDeploy(result, {
+        reason: 'runDelta real property changes',
+        source,
+        runId,
+      });
+    }
+    return result;
   }
 
   /**
@@ -1259,7 +1276,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
       const candidateIdsToProcess = candidateIds.slice(0, maxItems);
       for (const candidateId of candidateIdsToProcess) {
-        const r = await syncOne(candidateId, { runId, dryRun, source });
+        const r = await syncOne(candidateId, { runId, dryRun, source, suppressDeploy: true });
         items.push(...r.items);
 
         // syncOne never throws; failures surface as items with status === 'error'.
@@ -1328,7 +1345,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       duration_ms: Date.now() - startedAt,
     });
 
-    return {
+    const result = {
       run_id: runId,
       dry_run: dryRun,
       summary,
@@ -1338,6 +1355,14 @@ module.exports = ({ strapi: _strapi } = {}) => {
       last_successful_property_id: lastSuccessfulPropertyId,
       duration_ms: Date.now() - startedAt,
     };
+    if (!opts.suppressDeploy) {
+      await maybeTriggerFrontendDeploy(result, {
+        reason: 'runSniffer real property changes',
+        source,
+        runId,
+      });
+    }
+    return result;
   }
 
   async function runNext(opts = {}) {
@@ -1354,9 +1379,15 @@ module.exports = ({ strapi: _strapi } = {}) => {
       source: opts.source || 'runNext:delta',
       maxPages,
       maxItems,
+      suppressDeploy: true,
     });
 
     if (delta.skipped || delta.error || (delta.items || []).length > 0) {
+      await maybeTriggerFrontendDeploy(delta, {
+        reason: 'runNext real property changes',
+        source: opts.source || 'runNext:delta',
+        runId,
+      });
       return formatRunNextResult(delta, startedAt);
     }
 
@@ -1367,9 +1398,91 @@ module.exports = ({ strapi: _strapi } = {}) => {
       source: opts.source || 'runNext:sniffer',
       maxPages: opts.maxPages || readEnvNumber('KITEPROP_SYNC_SNIFFER_MAX_PAGES', 1),
       maxItems,
+      suppressDeploy: true,
     });
 
+    await maybeTriggerFrontendDeploy(sniffer, {
+      reason: 'runNext real property changes',
+      source: opts.source || 'runNext:sniffer',
+      runId,
+    });
     return formatRunNextResult(sniffer, startedAt);
+  }
+
+  async function runAll(opts = {}) {
+    const runId = opts.runId || newRunId();
+    const dryRun = !!opts.dryRun;
+    const startedAt = Date.now();
+    const source = opts.source || 'runAll';
+
+    const delta = await runDelta({
+      ...opts,
+      runId,
+      dryRun,
+      source: `${source}:delta`,
+      suppressDeploy: true,
+    });
+
+    const sniffer = await runSniffer({
+      ...opts,
+      runId,
+      dryRun,
+      source: `${source}:sniffer`,
+      suppressDeploy: true,
+    });
+
+    const combined = combineSyncResults({
+      runId,
+      dryRun,
+      results: [delta, sniffer],
+      durationMs: Date.now() - startedAt,
+    });
+
+    await maybeTriggerFrontendDeploy(combined, {
+      reason: 'runAll real property changes',
+      source,
+      runId,
+    });
+
+    return { ok: !combined.error, dry_run: dryRun, delta, sniffer, combined };
+  }
+
+  async function runInterval(opts = {}) {
+    const runId = opts.runId || newRunId();
+    const dryRun = !!opts.dryRun;
+    const startedAt = Date.now();
+    const source = opts.source || 'interval';
+
+    const delta = await runDelta({
+      ...opts,
+      runId,
+      dryRun,
+      source: `${source}:delta`,
+      suppressDeploy: true,
+    });
+
+    const sniffer = await runSniffer({
+      ...opts,
+      runId,
+      dryRun,
+      source: `${source}:sniffer`,
+      suppressDeploy: true,
+    });
+
+    const combined = combineSyncResults({
+      runId,
+      dryRun,
+      results: [delta, sniffer],
+      durationMs: Date.now() - startedAt,
+    });
+
+    await maybeTriggerFrontendDeploy(combined, {
+      reason: 'interval real property changes',
+      source,
+      runId,
+    });
+
+    return { ok: !combined.error, dry_run: dryRun, delta, sniffer, combined };
   }
 
   // ---------------------------------------------------------------------------
@@ -1414,11 +1527,45 @@ module.exports = ({ strapi: _strapi } = {}) => {
     };
   }
 
+  function combineSyncResults({ runId, dryRun, results, durationMs }) {
+    const items = results.flatMap((result) => result?.items || []);
+    const summary = summarize(items);
+    const errors = results
+      .map((result) => result?.error)
+      .filter((error) => typeof error === 'string' && error.trim());
+
+    return {
+      run_id: runId,
+      dry_run: !!dryRun,
+      summary,
+      items,
+      error: errors.length > 0 ? errors.join('; ') : null,
+      duration_ms: durationMs,
+    };
+  }
+
+  async function maybeTriggerFrontendDeploy(syncResult, { reason, source, runId }) {
+    const deploy = frontendDeploy();
+    const decision = deploy.shouldTriggerDeployFromSyncResult(syncResult);
+    if (!decision.shouldTrigger) return null;
+
+    return deploy.maybeTriggerDeploy({
+      reason,
+      source,
+      runId,
+      changedItems: decision.changedItems,
+      dryRun: !!syncResult.dry_run,
+      error: syncResult.error,
+    });
+  }
+
   return {
     syncOne,
     runDelta,
     runSniffer,
     runNext,
+    runAll,
+    runInterval,
     // Internal helpers exposed for testing/ops
     _internal: {
       upsertProperty,
@@ -1426,6 +1573,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       findByKitepropId,
       summarize,
       formatRunNextResult,
+      combineSyncResults,
     },
   };
 };
