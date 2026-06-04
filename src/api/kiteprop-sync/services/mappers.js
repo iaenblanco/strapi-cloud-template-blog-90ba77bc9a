@@ -120,44 +120,29 @@ function toBoolOrUndefined(v) {
 }
 
 // ---------------------------------------------------------------------------
-// Tag-based booleans (CONFIGURABLE — see TODO below)
+// Destacado / Oportunidades — driven by KiteProp postal_code
 // ---------------------------------------------------------------------------
 
 /**
- * Destacado / Oportunidades flag derivation.
- *
- * TODO (configurable): The exact tag conventions used by KiteProp to mark
- * "destacado" and "oportunidad" properties are not yet confirmed by the user.
- * Until confirmed, these are read from env vars with safe defaults:
- *
- *   KITEPROP_TAGS_DESTACADO   (comma-separated, default: "destacado")
- *   KITEPROP_TAGS_OPORTUNIDAD (comma-separated, default: "oportunidad,oportunidades")
- *
- * If neither tag is present, the field is NOT set (returns undefined) so any
- * manual value in Strapi is preserved.
+ * KiteProp uses `postal_code` as an internal signal for featured flags.
+ * The field can be a string, a number, null, or absent.
  */
-function getTagSet(envName, fallback) {
-  const raw = process.env[envName];
-  const list = (raw && raw.length > 0 ? raw : fallback)
-    .split(',')
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
-  return new Set(list);
+function getKitepropPostalCode(remote) {
+  if (remote == null || typeof remote !== 'object') return '';
+  const raw = remote.postal_code;
+  if (raw === null || raw === undefined) return '';
+  return String(raw).trim();
 }
 
-function tagsInclude(tags, set) {
-  if (!Array.isArray(tags)) return false;
-  return tags.some((t) => set.has(String(t).toLowerCase()));
-}
+const POSTAL_CODE_FLAGS = {
+  '000000': { Destacado: true, Oportunidades: false },
+  '000001': { Destacado: false, Oportunidades: true },
+  '000002': { Destacado: true, Oportunidades: true },
+};
 
-function mapDestacado(tags) {
-  const set = getTagSet('KITEPROP_TAGS_DESTACADO', 'destacado');
-  return tagsInclude(tags, set);
-}
-
-function mapOportunidades(tags) {
-  const set = getTagSet('KITEPROP_TAGS_OPORTUNIDAD', 'oportunidad,oportunidades');
-  return tagsInclude(tags, set);
+function mapFeaturedFlagsFromPostalCode(remote) {
+  const code = getKitepropPostalCode(remote);
+  return POSTAL_CODE_FLAGS[code] || { Destacado: false, Oportunidades: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +221,7 @@ function mapPropertyToStrapi(kp) {
   const objetivo = mapObjetivo(kp);
   const precio = mapPrecio(kp);
   const precioClp = mapPrecioCLP(kp);
-  const tags = Array.isArray(kp.tags) ? kp.tags : [];
+  const featuredFlags = mapFeaturedFlagsFromPostalCode(kp);
 
   const out = {
     // kiteprop_* technical fields (always set on sync)
@@ -274,15 +259,11 @@ function mapPropertyToStrapi(kp) {
     Piso: toIntOrNull(kp.floor),
     ano_construccion: toIntOrNull(kp.year_built),
 
-    // Booleans driven by status / tags
+    // Booleans driven by status and postal_code
     Publicado: isPublishedFromStatus(kp.status),
+    Destacado: featuredFlags.Destacado,
+    Oportunidades: featuredFlags.Oportunidades,
   };
-
-  // Tag-based booleans: only set when tag is detected (preserve manual edits otherwise)
-  if (tags.length > 0) {
-    out.Destacado = mapDestacado(tags);
-    out.Oportunidades = mapOportunidades(tags);
-  }
 
   // Strip undefined keys so Strapi treats them as "not provided"
   for (const k of Object.keys(out)) {
@@ -335,8 +316,8 @@ module.exports = {
   slugify,
   buildKitepropSlug,
   mapKitepropImagenes,
-  mapDestacado,
-  mapOportunidades,
+  getKitepropPostalCode,
+  mapFeaturedFlagsFromPostalCode,
   isPublishedFromStatus,
   mapPropertyToStrapi,
   buildSoftDeletePayload,

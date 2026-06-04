@@ -389,6 +389,90 @@ test('mapper leaves prices empty for unknown currency', () => {
   assert.equal(payload.Precio_CLP, null);
 });
 
+// ---------------------------------------------------------------------------
+// Destacado / Oportunidades — postal code logic
+// ---------------------------------------------------------------------------
+
+test('postal code "000000" sets Destacado=true Oportunidades=false', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ postal_code: '000000' }));
+
+  assert.equal(payload.Destacado, true);
+  assert.equal(payload.Oportunidades, false);
+});
+
+test('postal code "000001" sets Destacado=false Oportunidades=true', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ postal_code: '000001' }));
+
+  assert.equal(payload.Destacado, false);
+  assert.equal(payload.Oportunidades, true);
+});
+
+test('postal code "000002" sets Destacado=true Oportunidades=true', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ postal_code: '000002' }));
+
+  assert.equal(payload.Destacado, true);
+  assert.equal(payload.Oportunidades, true);
+});
+
+test('postal code null/undefined/absent sets both flags to false', () => {
+  for (const override of [{ postal_code: null }, { postal_code: undefined }, {}]) {
+    const payload = mappers.mapPropertyToStrapi(sampleProperty(override));
+
+    assert.equal(payload.Destacado, false, `Failed for postal_code=${JSON.stringify(override.postal_code)}`);
+    assert.equal(payload.Oportunidades, false, `Failed for postal_code=${JSON.stringify(override.postal_code)}`);
+  }
+});
+
+test('postal code empty string sets both flags to false', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ postal_code: '' }));
+
+  assert.equal(payload.Destacado, false);
+  assert.equal(payload.Oportunidades, false);
+});
+
+test('postal code "123456" (unrecognized) sets both flags to false', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ postal_code: '123456' }));
+
+  assert.equal(payload.Destacado, false);
+  assert.equal(payload.Oportunidades, false);
+});
+
+test('tags with "destacado" do NOT influence flags when postal code does not match', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({
+    tags: ['destacado'],
+    postal_code: '999999',
+  }));
+
+  assert.equal(payload.Destacado, false);
+  assert.equal(payload.Oportunidades, false);
+});
+
+test('previously featured property gets flags cleared when postal code changes to non-matching', () => {
+  const payload = mappers.mapPropertyToStrapi(sampleProperty({ postal_code: '12345' }));
+
+  assert.equal(payload.Destacado, false);
+  assert.equal(payload.Oportunidades, false);
+});
+
+test('getKitepropPostalCode preserves leading zeros from string', () => {
+  assert.equal(mappers.getKitepropPostalCode({ postal_code: '000001' }), '000001');
+});
+
+test('getKitepropPostalCode converts number 0 to "0" (not "000000")', () => {
+  assert.equal(mappers.getKitepropPostalCode({ postal_code: 0 }), '0');
+});
+
+test('getKitepropPostalCode trims whitespace', () => {
+  assert.equal(mappers.getKitepropPostalCode({ postal_code: '  000000  ' }), '000000');
+});
+
+test('getKitepropPostalCode returns empty string for null/undefined', () => {
+  assert.equal(mappers.getKitepropPostalCode({ postal_code: null }), '');
+  assert.equal(mappers.getKitepropPostalCode({ postal_code: undefined }), '');
+  assert.equal(mappers.getKitepropPostalCode(null), '');
+  assert.equal(mappers.getKitepropPostalCode({}), '');
+});
+
 test('slug helper includes kiteprop_id and normalizes accents and symbols', () => {
   const slug = mappers.buildKitepropSlug(
     'Oportunidad de Inversión: Depto 1D/1B en Estación Central',
@@ -1466,6 +1550,47 @@ test('mapping audit detects duplicate_image_key', async () => {
   const result = await loadMappingAuditService().audit({ kitepropId: 101 });
 
   assert.ok(result.properties[0].issues.some((item) => item.code === 'duplicate_image_key'));
+});
+
+test('mapping audit detects Destacado mismatch from postal code', async () => {
+  const kp = sampleProperty({ postal_code: '000000' });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Destacado: false }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'destacado_mismatch'));
+  assert.equal(result.properties[0].checks.featured_flags.kiteprop.postal_code, '000000');
+  assert.equal(result.properties[0].checks.featured_flags.expected.Destacado, true);
+});
+
+test('mapping audit detects Oportunidades mismatch from postal code', async () => {
+  const kp = sampleProperty({ postal_code: '000001' });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { Oportunidades: false }) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.ok(result.properties[0].issues.some((item) => item.code === 'oportunidades_mismatch'));
+  assert.equal(result.properties[0].checks.featured_flags.expected.Oportunidades, true);
+});
+
+test('mapping audit shows healthy featured_flags when postal code matches Strapi', async () => {
+  const kp = sampleProperty({ postal_code: '000002' });
+  installStrapiMock({
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp) },
+    kitepropImageRows: kitepropImageRowsFor(kp),
+  });
+  const result = await loadMappingAuditService().audit({ kitepropId: 101 });
+
+  assert.equal(result.properties[0].checks.featured_flags.status, 'ok');
+  assert.equal(result.properties[0].checks.featured_flags.expected.Destacado, true);
+  assert.equal(result.properties[0].checks.featured_flags.expected.Oportunidades, true);
 });
 
 test('mapping audit detects data_hash mismatch', async () => {

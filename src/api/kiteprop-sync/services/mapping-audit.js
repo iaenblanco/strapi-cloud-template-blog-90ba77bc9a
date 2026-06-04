@@ -512,24 +512,22 @@ module.exports = ({ strapi: _strapi } = {}) => {
     };
   }
 
-  function checkTags(kp, local, expected) {
-    const tags = Array.isArray(kp.tags) ? kp.tags : [];
+  function checkFeaturedFlags(kp, local, expected) {
+    const postalCode = mappers.getKitepropPostalCode(kp);
     const issues = [];
-    if (tags.length > 0) {
-      if (Object.prototype.hasOwnProperty.call(expected, 'Destacado') && local?.Destacado !== expected.Destacado) {
-        issues.push(issue('destacado_mismatch', 'warning', 'Destacado differs from tag-based mapper output.'));
-      }
-      if (Object.prototype.hasOwnProperty.call(expected, 'Oportunidades') && local?.Oportunidades !== expected.Oportunidades) {
-        issues.push(issue('oportunidades_mismatch', 'warning', 'Oportunidades differs from tag-based mapper output.'));
-      }
+    if (local?.Destacado !== expected.Destacado) {
+      issues.push(issue('destacado_mismatch', 'warning', 'Destacado differs from postal-code-based mapper output.'));
+    }
+    if (local?.Oportunidades !== expected.Oportunidades) {
+      issues.push(issue('oportunidades_mismatch', 'warning', 'Oportunidades differs from postal-code-based mapper output.'));
     }
     return {
       status: maxStatus(issues.map((item) => item.severity)),
-      kiteprop: { tags },
+      kiteprop: { postal_code: postalCode || null },
       strapi: { Destacado: local?.Destacado ?? null, Oportunidades: local?.Oportunidades ?? null },
       expected: {
-        Destacado: Object.prototype.hasOwnProperty.call(expected, 'Destacado') ? expected.Destacado : undefined,
-        Oportunidades: Object.prototype.hasOwnProperty.call(expected, 'Oportunidades') ? expected.Oportunidades : undefined,
+        Destacado: expected.Destacado,
+        Oportunidades: expected.Oportunidades,
       },
       issues,
     };
@@ -802,7 +800,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       status_publication: checkPublication(kp, local, expected),
       location: checkLocation(kp, local, expected),
       specs: checkSpecs(kp, local, expected),
-      tags: checkTags(kp, local, expected),
+      featured_flags: checkFeaturedFlags(kp, local, expected),
       title_slug: checkTitleSlug(kp, local, expected),
       hashes: checkHashes(local, expected, normalizedImages),
       sync_status: checkSyncStatus(local),
