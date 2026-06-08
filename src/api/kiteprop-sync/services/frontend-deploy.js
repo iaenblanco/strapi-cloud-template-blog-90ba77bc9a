@@ -347,25 +347,38 @@ module.exports = ({ strapi: _strapi } = {}) => {
    * deploy que hubiera quedado pendiente antes.
    */
   async function maybeTriggerDeploy({ reason, source, runId, changedItems, dryRun, error } = {}) {
-    // Un dry-run jamás deploya: no representa cambios reales en Strapi.
+    // Un dry-run jamás deploya ni toca el estado: no representa cambios reales.
     if (dryRun) {
       strapi.log.info('[frontend-deploy] deploy omitido: dryRun=true');
       return { triggered: false, skipped: true, reason: 'dry_run' };
     }
 
-    // Si la corrida tuvo error de sync, no es un momento seguro para deployar.
-    if (error) {
-      strapi.log.warn(`[frontend-deploy] deploy omitido: error de sync (${String(error).slice(0, 200)})`);
-      return { triggered: false, skipped: true, reason: 'sync_error' };
-    }
-
     const normalizedChanges = changedItems || {};
-    if (hasRealChanges(normalizedChanges)) {
+    const hasChanges = hasRealChanges(normalizedChanges);
+
+    // CASO BORDE: una corrida puede aplicar cambios reales en Strapi y DESPUÉS
+    // terminar con error (p.ej. falla la siguiente página/actividad). Si hubo
+    // cambios reales, SIEMPRE marcamos pending_deploy=true ANTES de cualquier
+    // early-return, para no perder el deploy aunque la corrida haya fallado.
+    if (hasChanges) {
       await markDeployPending({
         reason,
         changedCount: totalChanges(normalizedChanges),
         source,
       });
+    }
+
+    // Si la corrida tuvo error de sync NO deployamos ahora (conservador), pero el
+    // pendiente queda guardado para procesarse en la próxima oportunidad segura.
+    if (error) {
+      if (hasChanges) {
+        strapi.log.warn(
+          `[frontend-deploy] cambios reales con error de sync: deploy diferido, se mantiene pendiente (${String(error).slice(0, 200)})`
+        );
+        return { triggered: false, skipped: true, reason: 'sync_error_pending', pending: true };
+      }
+      strapi.log.warn(`[frontend-deploy] deploy omitido: error de sync sin cambios reales (${String(error).slice(0, 200)})`);
+      return { triggered: false, skipped: true, reason: 'sync_error' };
     }
 
     return processPendingDeploy({ reason, source, runId });

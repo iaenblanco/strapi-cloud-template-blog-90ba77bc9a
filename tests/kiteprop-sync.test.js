@@ -1134,6 +1134,88 @@ test('coordinador: deploy pendiente previo se drena en una corrida sin cambios n
   assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), false);
 });
 
+test('coordinador: cambios reales + error de corrida conserva pending y no deploya', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'partial success then error',
+    source: 'test',
+    changedItems: { updated: 1 },
+    error: 'KiteProp unavailable on next page',
+  });
+
+  // Decisión conservadora: no deploya YA por el error...
+  assert.equal(result.reason, 'sync_error_pending');
+  assert.equal(result.triggered, false);
+  assert.equal(result.pending, true);
+  assert.equal(fetchCalls.length, 0);
+  // ...pero el cambio NO se pierde: queda pendiente para la próxima corrida segura.
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_last_changed_count'), 1);
+});
+
+test('coordinador: error de corrida sin cambios reales no marca pendiente', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'error without changes',
+    source: 'test',
+    changedItems: {},
+    error: 'KiteProp unavailable',
+  });
+
+  assert.equal(result.reason, 'sync_error');
+  assert.equal(fetchCalls.length, 0);
+  // 0 cambios -> no se marca pendiente (regla: 0 deploys si no hubo cambios).
+  assert.equal(calls.storeSets.some((item) => item.key === 'frontend_deploy_pending' && item.value === true), false);
+});
+
+test('runDelta: cambios exitosos seguidos de error dejan pending_deploy=true sin deployar', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    activities: [
+      { id: 50, property_id: 101, type: 'data_changed', created_at: '2026-05-01T00:00:00Z' },
+      { id: 51, property_id: 102, type: 'data_changed', created_at: '2026-05-01T00:01:00Z' },
+    ],
+    properties: {
+      101: sampleProperty({ id: 101 }),
+      102: new Error('KiteProp unavailable'),
+    },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-partial', dryRun: false, maxPages: 1, maxItems: 2 });
+
+  // Hubo un cambio real (101 creado) y luego error (102).
+  assert.equal(result.summary.created, 1);
+  assert.ok(result.error);
+  // No se deploya en el acto por el error...
+  assert.equal(fetchCalls.length, 0);
+  // ...pero el deploy queda pendiente: el cambio en Strapi no se pierde.
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+});
+
 test('runDelta keeps sync successful when Cloudflare hook fails', async () => {
   process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
   process.env.FRONTEND_DEPLOY_ENABLED = 'true';
