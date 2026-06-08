@@ -1545,10 +1545,17 @@ module.exports = ({ strapi: _strapi } = {}) => {
   }
 
   async function maybeTriggerFrontendDeploy(syncResult, { reason, source, runId }) {
+    // Un dry-run nunca debe deployar ni tocar el estado de deploy.
+    if (syncResult && syncResult.dry_run) return null;
+
     const deploy = frontendDeploy();
     const decision = deploy.shouldTriggerDeployFromSyncResult(syncResult);
-    if (!decision.shouldTrigger) return null;
 
+    // Delegamos SIEMPRE al coordinador (punto único de decisión):
+    //   - si hubo cambios reales -> marca pendiente y deploya (respetando debounce);
+    //   - si no hubo cambios -> igualmente intenta drenar un deploy que pudiera
+    //     haber quedado pendiente de una corrida anterior (hook caído / debounce).
+    // El coordinador NO deploya solo por haber corrido: solo si pending_deploy=true.
     return deploy.maybeTriggerDeploy({
       reason,
       source,
@@ -1559,13 +1566,31 @@ module.exports = ({ strapi: _strapi } = {}) => {
     });
   }
 
+  /**
+   * Envuelve un método público del sync para señalar a los lifecycles de
+   * `propiedad` que el sync está escribiendo en Strapi. POR QUÉ: así los
+   * lifecycles NO marcan deploy por cada write del sync (evita el loop /
+   * deploys duplicados). El deploy lo decide el final de la corrida, agrupado.
+   */
+  function withSyncWrites(fn) {
+    return async function (...args) {
+      const deploy = frontendDeploy();
+      deploy.beginSyncWrites();
+      try {
+        return await fn(...args);
+      } finally {
+        deploy.endSyncWrites();
+      }
+    };
+  }
+
   return {
-    syncOne,
-    runDelta,
-    runSniffer,
-    runNext,
-    runAll,
-    runInterval,
+    syncOne: withSyncWrites(syncOne),
+    runDelta: withSyncWrites(runDelta),
+    runSniffer: withSyncWrites(runSniffer),
+    runNext: withSyncWrites(runNext),
+    runAll: withSyncWrites(runAll),
+    runInterval: withSyncWrites(runInterval),
     // Internal helpers exposed for testing/ops
     _internal: {
       upsertProperty,
