@@ -968,6 +968,172 @@ test('frontend deploy does not call hook twice inside minimum interval', async (
   assert.equal(fetchCalls.length, 0);
 });
 
+function lastStoreValue(calls, key) {
+  const entry = [...calls.storeSets].reverse().find((item) => item.key === key);
+  return entry ? entry.value : undefined;
+}
+
+test('coordinador: sin cambios ni pendiente no deploya', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().processPendingDeploy({ source: 'test' });
+
+  assert.equal(result.reason, 'no_pending');
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('coordinador: el debounce deja un deploy pendiente persistente', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS = '600000';
+  const calls = installStrapiMock({
+    storeValues: { last_frontend_deploy_at: new Date().toISOString() },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'changes within debounce',
+    source: 'test',
+    changedItems: { created: 2 },
+  });
+
+  assert.equal(result.reason, 'debounce');
+  assert.equal(fetchCalls.length, 0);
+  // POR QUÉ: no perdemos el cambio; queda pendiente para la próxima corrida segura.
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_last_changed_count'), 2);
+});
+
+test('coordinador: si el hook falla, mantiene pending_deploy=true', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock();
+  global.fetch = async () => ({ ok: false, status: 500 });
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'hook will fail',
+    source: 'test',
+    changedItems: { updated: 1 },
+  });
+
+  assert.equal(result.reason, 'hook_error');
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+  assert.ok(lastStoreValue(calls, 'frontend_deploy_last_error'));
+});
+
+test('coordinador: un deploy exitoso limpia el pendiente', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'real change',
+    source: 'test',
+    changedItems: { created: 1 },
+  });
+
+  assert.equal(result.triggered, true);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), false);
+});
+
+test('coordinador: cambio manual marca pendiente y deploya cuando corresponde', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock();
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().notifyManualChange({
+    reason: 'manual update propiedad',
+    source: 'lifecycle:update',
+  });
+
+  assert.equal(result.triggered, true);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), false);
+});
+
+test('coordinador: cambio manual respeta el debounce y deja pendiente', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS = '600000';
+  const calls = installStrapiMock({
+    storeValues: { last_frontend_deploy_at: new Date().toISOString() },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  const result = await loadFrontendDeployService().notifyManualChange({
+    reason: 'manual create propiedad',
+    source: 'lifecycle:create',
+  });
+
+  assert.equal(result.reason, 'debounce');
+  assert.equal(fetchCalls.length, 0);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+});
+
+test('coordinador: anti-loop begin/end marca escritura de sync en progreso', () => {
+  installStrapiMock();
+  const deploy = loadFrontendDeployService();
+
+  assert.equal(deploy.isSyncWriteInProgress(), false);
+  deploy.beginSyncWrites();
+  deploy.beginSyncWrites();
+  assert.equal(deploy.isSyncWriteInProgress(), true);
+  deploy.endSyncWrites();
+  assert.equal(deploy.isSyncWriteInProgress(), true);
+  deploy.endSyncWrites();
+  assert.equal(deploy.isSyncWriteInProgress(), false);
+});
+
+test('coordinador: deploy pendiente previo se drena en una corrida sin cambios nuevos', async () => {
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    storeValues: { frontend_deploy_pending: true },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+
+  // Sin cambios nuevos (changedItems vacío) pero con pendiente previo: debe deployar.
+  const result = await loadFrontendDeployService().maybeTriggerDeploy({
+    reason: 'drain pending',
+    source: 'test',
+    changedItems: {},
+  });
+
+  assert.equal(result.triggered, true);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), false);
+});
+
 test('runDelta keeps sync successful when Cloudflare hook fails', async () => {
   process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
   process.env.FRONTEND_DEPLOY_ENABLED = 'true';
@@ -984,7 +1150,7 @@ test('runDelta keeps sync successful when Cloudflare hook fails', async () => {
   assert.equal(result.error, null);
   assert.equal(result.summary.created, 1);
   assert.equal(calls.bumpActivityCursor.length, 1);
-  assert.ok(calls.errorLogs.some((message) => /Cloudflare deploy hook failed/.test(message)));
+  assert.ok(calls.errorLogs.some((message) => /deploy fallido/.test(message)));
 });
 
 test('runDelta alone can trigger frontend deploy', async () => {

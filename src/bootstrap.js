@@ -22,32 +22,57 @@ function readEnvNumber(name, fallback) {
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback;
 }
 
+function isCronEnabled() {
+  return String(process.env.CRON_ENABLED || 'false').toLowerCase() === 'true';
+}
+
 function startKitepropSyncInterval() {
   if (!isKitepropSyncEnabled()) return;
   if (String(process.env.KITEPROP_SYNC_INTERVAL_DISABLED || 'false').toLowerCase() === 'true') return;
+  // El cron de Strapi es la FUENTE PRINCIPAL de ejecución. Si CRON_ENABLED=true,
+  // el setInterval cede para no duplicar corridas ni deploys. El interval queda
+  // como FALLBACK para entornos donde el cron no esté disponible.
+  if (isCronEnabled()) {
+    strapi.log.info('[kiteprop-sync][interval] desactivado: CRON_ENABLED=true (el cron horario es la fuente principal)');
+    return;
+  }
   if (global[KITEPROP_INTERVAL_KEY]) return;
 
-  const intervalMs = readEnvNumber('KITEPROP_SYNC_INTERVAL_MS', 10 * 60 * 1000);
-  const maxItems = readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1);
-  const maxPages = readEnvNumber('KITEPROP_SYNC_INTERVAL_MAX_PAGES', 1);
+  // Por defecto, revisión horaria en lote (mismo comportamiento que el cron).
+  const intervalMs = readEnvNumber('KITEPROP_SYNC_INTERVAL_MS', 60 * 60 * 1000);
+  const maxItems = readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 50);
+  const maxPages = readEnvNumber('KITEPROP_SYNC_MAX_PAGES_PER_RUN', 5);
 
   async function runIntervalSync() {
     const dryRun = isKitepropDryRunDefault();
     try {
+      strapi.log.info(
+        `[kiteprop-sync][interval] corrida KiteProp iniciada (runAll) dryRun=${dryRun} maxItems=${maxItems} maxPages=${maxPages}`
+      );
       const sync = strapi.service('api::kiteprop-sync.properties-sync');
-      await sync.runInterval({ source: 'interval', dryRun, maxPages, maxItems });
+      // runAll agrupa los cambios y deploya UNA sola vez al final si corresponde.
+      await sync.runAll({ source: 'interval:runAll', dryRun, maxPages, maxItems });
     } catch (err) {
       strapi.log.error(`[kiteprop-sync][interval] failed: ${err.message}`);
     }
   }
 
   strapi.log.info(
-    `[kiteprop-sync][interval] enabled every ${intervalMs}ms, maxItems=${maxItems}, maxPages=${maxPages}`
+    `[kiteprop-sync][interval] habilitado cada ${intervalMs}ms, maxItems=${maxItems}, maxPages=${maxPages}`
   );
 
   global[KITEPROP_INTERVAL_KEY] = setInterval(runIntervalSync, intervalMs);
   global[KITEPROP_INTERVAL_KEY].unref?.();
   setTimeout(runIntervalSync, 60 * 1000).unref?.();
+}
+
+async function clearStaleDeployState() {
+  try {
+    const deploy = strapi.service('api::kiteprop-sync.frontend-deploy');
+    await deploy.clearStaleInProgress();
+  } catch (err) {
+    strapi.log.warn(`[frontend-deploy] no se pudo limpiar deploy_in_progress al arrancar: ${err.message}`);
+  }
 }
 
 async function seedExampleApp() {
@@ -316,5 +341,8 @@ async function main() {
 
 module.exports = async () => {
   await seedExampleApp();
+  // Limpiamos cualquier estado de deploy "en curso" colgado de un reinicio previo,
+  // de lo contrario el coordinador podría no volver a deployar nunca.
+  await clearStaleDeployState();
   startKitepropSyncInterval();
 };
