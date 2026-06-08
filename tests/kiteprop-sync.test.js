@@ -136,6 +136,8 @@ function installStrapiMock(options = {}) {
     releaseLock: [],
     findImageFilters: [],
     listProperties: [],
+    listActivities: [],
+    getProperty: [],
     strapiFindMany: [],
     storeGets: [],
     storeSets: [],
@@ -218,12 +220,22 @@ function installStrapiMock(options = {}) {
 
   const client = {
     async getProperty(id) {
+      calls.getProperty.push(Number(id));
       const value = options.properties?.[id];
       if (value instanceof Error) throw value;
       return { data: { data: value || sampleProperty({ id }) } };
     },
-    async listActivities() {
-      return { data: { data: options.activities || [] } };
+    async listActivities(params = {}) {
+      calls.listActivities.push(params);
+      if (options.activityListError) throw options.activityListError;
+      // Soporta paginación explícita (options.activityPages keyed by page) para
+      // simular el orden created_at:desc real de KiteProp. Si no, devuelve la
+      // lista plana options.activities en la página 1.
+      if (options.activityPages) {
+        const page = options.activityPages[params.page] || [];
+        return { data: { data: page } };
+      }
+      return { data: { data: params.page === 1 ? options.activities || [] : [] } };
     },
     async listProperties() {
       const params = arguments[0] || {};
@@ -337,6 +349,8 @@ test.beforeEach(() => {
   global.fetch = originalFetch;
   process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'true';
   process.env.KITEPROP_SYNC_MAX_IMAGES_PER_PROPERTY = '12';
+  delete process.env.KITEPROP_SYNC_PAGE_SIZE_PROPERTIES;
+  delete process.env.KITEPROP_SYNC_DELTA_MAX_PAGES;
   delete process.env.FRONTEND_DEPLOY_ENABLED;
   delete process.env.FRONTEND_DEPLOY_HOOK_URL;
   delete process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS;
@@ -1132,6 +1146,232 @@ test('coordinador: deploy pendiente previo se drena en una corrida sin cambios n
   assert.equal(result.triggered, true);
   assert.equal(fetchCalls.length, 1);
   assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), false);
+});
+
+test('runDelta: detecta actividad nueva aunque el cursor esté atrasado (desc, multipágina)', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.KITEPROP_SYNC_PAGE_SIZE_PROPERTIES = '2';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 117977, last_max_property_id: 0 },
+    activityPages: {
+      // created_at:desc -> lo más nuevo primero.
+      1: [
+        { id: 118002, property_id: 506022, type: 'data_changed', created_at: '2026-06-01T10:00:00Z' },
+        { id: 118001, property_id: 999, type: 'data_changed', created_at: '2026-06-01T09:00:00Z' },
+      ],
+      2: [
+        { id: 118000, property_id: 888, type: 'data_changed', created_at: '2026-05-31T10:00:00Z' },
+        // cruza el cursor: de aquí en más es viejo.
+        { id: 117977, property_id: 1, type: 'data_changed', created_at: '2026-04-27T10:00:00Z' },
+      ],
+    },
+    properties: {
+      506022: sampleProperty({ id: 506022 }),
+      999: sampleProperty({ id: 999 }),
+      888: sampleProperty({ id: 888 }),
+    },
+  });
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-desc', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  // Encontró las 3 nuevas (118000, 118001, 118002) pese al cursor atrasado.
+  assert.equal(result.summary.created, 3);
+  assert.equal(result.summary.new_activities_collected, 3);
+  assert.equal(result.summary.boundary_reached, true);
+  assert.ok(calls.getProperty.includes(506022));
+  // Cursor avanza hasta la actividad nueva más alta.
+  assert.equal(result.summary.final_cursor, 118002);
+});
+
+test('runDelta: no se queda atrapado si la primera página trae solo actividades ya conocidas', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 117977, last_max_property_id: 0 },
+    activityPages: {
+      1: [
+        { id: 117977, property_id: 1, type: 'data_changed', created_at: '2026-04-27T10:00:00Z' },
+        { id: 117000, property_id: 2, type: 'data_changed', created_at: '2026-04-20T10:00:00Z' },
+      ],
+    },
+  });
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-known', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.new_activities_collected, 0);
+  assert.equal(result.summary.items_processed, 0);
+  assert.equal(result.summary.created, 0);
+  assert.equal(calls.getProperty.length, 0);
+  assert.equal(calls.bumpActivityCursor.length, 0);
+});
+
+test('runDelta: procesa las actividades nuevas en orden ascendente seguro', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.KITEPROP_SYNC_PAGE_SIZE_PROPERTIES = '2';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 100, last_max_property_id: 0 },
+    activityPages: {
+      1: [
+        { id: 203, property_id: 503, type: 'data_changed', created_at: '2026-06-03T00:00:00Z' },
+        { id: 202, property_id: 502, type: 'data_changed', created_at: '2026-06-02T00:00:00Z' },
+      ],
+      2: [
+        { id: 201, property_id: 501, type: 'data_changed', created_at: '2026-06-01T00:00:00Z' },
+        { id: 100, property_id: 1, type: 'data_changed', created_at: '2026-04-01T00:00:00Z' },
+      ],
+    },
+    properties: {
+      501: sampleProperty({ id: 501 }),
+      502: sampleProperty({ id: 502 }),
+      503: sampleProperty({ id: 503 }),
+    },
+  });
+  const service = loadService();
+
+  await service.runDelta({ runId: 'run-order', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  const bumpedIds = calls.bumpActivityCursor.map((activity) => Number(activity.id));
+  assert.deepEqual(bumpedIds, [201, 202, 203]);
+});
+
+test('runDelta: varias actividades de una misma propiedad hacen un solo syncOne', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 100, last_max_property_id: 0 },
+    activityPages: {
+      1: [
+        { id: 205, property_id: 506022, type: 'price_update', created_at: '2026-06-05T00:00:00Z' },
+        { id: 204, property_id: 506022, type: 'status_changed', created_at: '2026-06-04T00:00:00Z' },
+        { id: 203, property_id: 506022, type: 'data_changed', created_at: '2026-06-03T00:00:00Z' },
+      ],
+    },
+    properties: { 506022: sampleProperty({ id: 506022 }) },
+  });
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-dedupe', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  // Una sola llamada a getProperty pese a 3 actividades de la misma propiedad.
+  assert.equal(calls.getProperty.filter((id) => id === 506022).length, 1);
+  assert.equal(result.summary.created, 1);
+  // Las 3 actividades se acusan (avanzan cursor) aunque solo haya 1 syncOne.
+  assert.equal(calls.bumpActivityCursor.length, 3);
+  assert.equal(result.summary.final_cursor, 205);
+});
+
+test('runDelta: sin actividades nuevas no procesa nada ni deploya', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 500, last_max_property_id: 0 },
+    activityPages: { 1: [] },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-empty', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.new_activities_collected, 0);
+  assert.equal(result.summary.created, 0);
+  assert.equal(calls.getProperty.length, 0);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('runDelta: dryRun no avanza cursor', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 100, last_max_property_id: 0 },
+    activityPages: {
+      1: [
+        { id: 201, property_id: 506022, type: 'data_changed', created_at: '2026-06-01T00:00:00Z' },
+      ],
+    },
+    properties: { 506022: sampleProperty({ id: 506022 }) },
+  });
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-dry', dryRun: true, maxPages: 5, maxItems: 10 });
+
+  assert.equal(calls.bumpActivityCursor.length, 0);
+  assert.equal(calls.propertyCreates.length, 0);
+  assert.equal(result.summary.final_cursor, 100);
+});
+
+test('runDelta: backlog mayor a maxPages NO avanza el cursor (sin pérdida de actividades)', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.KITEPROP_SYNC_PAGE_SIZE_PROPERTIES = '2';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 100, last_max_property_id: 0 },
+    activityPages: {
+      // Dos páginas llenas (==pageSize) sin cruzar el cursor: hay más viejas sin ver.
+      1: [
+        { id: 310, property_id: 510, type: 'data_changed', created_at: '2026-06-10T00:00:00Z' },
+        { id: 309, property_id: 509, type: 'data_changed', created_at: '2026-06-09T00:00:00Z' },
+      ],
+      2: [
+        { id: 308, property_id: 508, type: 'data_changed', created_at: '2026-06-08T00:00:00Z' },
+        { id: 307, property_id: 507, type: 'data_changed', created_at: '2026-06-07T00:00:00Z' },
+      ],
+    },
+    properties: {
+      507: sampleProperty({ id: 507 }),
+      508: sampleProperty({ id: 508 }),
+      509: sampleProperty({ id: 509 }),
+      510: sampleProperty({ id: 510 }),
+    },
+  });
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-backlog', dryRun: false, maxPages: 2, maxItems: 10 });
+
+  // Procesa lo recolectado (refresca el sitio) pero NO mueve el cursor.
+  assert.equal(result.summary.boundary_reached, false);
+  assert.equal(result.summary.final_cursor, 100);
+  assert.equal(calls.bumpActivityCursor.length, 0);
+  assert.ok(result.summary.created >= 1);
+});
+
+test('runDelta: error no avanza cursor más allá del último exitoso y conserva pending', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const calls = installStrapiMock({
+    state: { last_activity_id: 100, last_max_property_id: 0 },
+    activityPages: {
+      1: [
+        { id: 202, property_id: 102, type: 'data_changed', created_at: '2026-06-02T00:00:00Z' },
+        { id: 201, property_id: 101, type: 'data_changed', created_at: '2026-06-01T00:00:00Z' },
+      ],
+    },
+    properties: {
+      101: sampleProperty({ id: 101 }),
+      102: new Error('KiteProp unavailable'),
+    },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runDelta({ runId: 'run-err', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  // 201 (101) OK, 202 (102) falla -> aborta.
+  assert.equal(result.summary.created, 1);
+  assert.equal(result.summary.errors, 1);
+  assert.ok(result.error);
+  // Cursor solo avanzó hasta la última exitosa (201), no hasta 202.
+  assert.deepEqual(calls.bumpActivityCursor.map((a) => Number(a.id)), [201]);
+  // Hubo cambios reales + error -> no deploya ya, pero queda pendiente.
+  assert.equal(fetchCalls.length, 0);
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
 });
 
 test('coordinador: cambios reales + error de corrida conserva pending y no deploya', async () => {

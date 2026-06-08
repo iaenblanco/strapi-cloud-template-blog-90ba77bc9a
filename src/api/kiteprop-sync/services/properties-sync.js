@@ -910,22 +910,37 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
   /**
    * Walk /properties/activities since the stored cursor.
-   *   - Order: created_at:asc (so we can advance the cursor monotonically).
-   *   - For each activity:
-   *       - delete_property → softDeleteProperty(property_id)
-   *       - any other relevant type → syncOne(property_id)
-   *   - Activities for the same property are deduplicated within a run
-   *     (we only fetch each property once per run).
    *
-   * Limitations from KiteProp docs:
-   *   - There is no "property_created" activity type. Use runSniffer() for new IDs.
+   * Order: created_at:DESC (lo más NUEVO primero).
+   *   POR QUÉ desc y no asc: en asc, la página 1 trae las actividades más
+   *   VIEJAS. Con el cursor adelantado (p.ej. last_activity_id muy atrás), todas
+   *   las de la página 1 son <= cursor, el walk no "avanza" y corta sin llegar
+   *   nunca a las actividades nuevas. Resultado real observado: activities_seen=50,
+   *   items_processed=0 aunque sí había cambios recientes. Con desc recolectamos
+   *   lo nuevo desde el inicio sin quedarnos atrapados en una página antigua.
+   *
+   * Estrategia (dos fases, conservadora con los API calls):
+   *   FASE 1 — COLLECT: recorre desc y junta actividades con id > last_activity_id,
+   *     hasta CRUZAR el cursor (ver un id <= last_activity_id) o agotar maxPages /
+   *     llegar a la última página.
+   *   FASE 2 — PROCESS: ordena las nuevas ASCENDENTE (cursor monotónico), deduplica
+   *     por property_id (una propiedad con varias actividades se sincroniza una sola
+   *     vez con su estado final, porque syncOne trae el estado actual de KiteProp),
+   *     y procesa con stop-on-first-failure.
+   *
+   * Seguridad del cursor (sin pérdida de datos):
+   *   Solo avanzamos el cursor si confirmamos haber visto el conjunto COMPLETO de
+   *   actividades nuevas (cruzamos el cursor o leímos hasta la última página). Si
+   *   agotamos maxPages sin cruzar el cursor, hay actividades nuevas más viejas que
+   *   no vimos: procesamos las nuevas recolectadas (para refrescar el sitio, y es
+   *   idempotente) pero NO movemos el cursor, para no saltarnos las no vistas.
    */
   async function runDelta(opts = {}) {
     const runId = opts.runId || newRunId();
     const dryRun = !!opts.dryRun;
     const source = opts.source || 'runDelta';
     const startedAt = Date.now();
-    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 1);
+    const maxPages = opts.maxPages || readEnvNumber('KITEPROP_SYNC_DELTA_MAX_PAGES', 10);
     const maxItems = readPositiveNumber(
       opts.maxItems,
       readEnvNumber('KITEPROP_SYNC_MAX_ITEMS_PER_RUN', 1)
@@ -955,12 +970,19 @@ module.exports = ({ strapi: _strapi } = {}) => {
     let lastError = null;
     let activitiesSeen = 0;
     let itemsProcessed = 0;
+    let pagesRead = 0;
+    let newActivitiesCollected = 0;
+    let relevantActivities = 0;
+    let ignoredOldActivities = 0;
+    let ignoredIrrelevantActivities = 0;
     let abortedAtActivityId = null;
     let lastSuccessfulActivityId = null;
+    let fromActivityId = 0;
+    let boundaryReached = false;
 
     try {
       const current = await state().read();
-      const fromActivityId =
+      fromActivityId =
         opts.fromActivityId !== undefined
           ? Number(opts.fromActivityId)
           : current.last_activity_id
@@ -973,145 +995,188 @@ module.exports = ({ strapi: _strapi } = {}) => {
         resource: 'property',
         action: 'delta',
         status: 'ok',
-        message: `start runDelta from activity_id>${fromActivityId}, maxPages=${maxPages}, maxItems=${maxItems}${dryRun ? ' (dry-run: cursor will NOT advance)' : ''}`,
+        message: `start runDelta order=created_at:desc fromActivityId=${fromActivityId} maxPages=${maxPages} maxItems=${maxItems}${dryRun ? ' (dry-run: cursor will NOT advance)' : ''}`,
         dry_run: dryRun,
       });
 
+      // -----------------------------------------------------------------------
+      // FASE 1 — COLLECT (created_at:desc, lo más nuevo primero)
+      // -----------------------------------------------------------------------
+      const newActivities = [];
+      let reachedKnown = false; // cruzamos el cursor (id <= fromActivityId)
+      let reachedEnd = false; // leímos la última página (no quedan más viejas)
       let page = 1;
-      let maxItemsReached = false;
-      while (page <= maxPages && abortedAtActivityId === null && !maxItemsReached) {
+      while (page <= maxPages) {
         const res = await client().listActivities({
           page,
           limit: pageSize,
-          order: 'created_at:asc',
+          order: 'created_at:desc',
         });
         const activities = res?.data?.data || [];
-        if (activities.length === 0) break;
-
-        let advanced = false;
+        pagesRead += 1;
+        if (activities.length === 0) {
+          reachedEnd = true;
+          break;
+        }
 
         for (const activity of activities) {
           activitiesSeen += 1;
           const activityId = Number(activity.id);
           if (!Number.isFinite(activityId)) continue;
-          if (activityId <= fromActivityId) continue;
-          advanced = true;
-
-          // Skip irrelevant activity types — these are not "failures",
-          // just things we don't process. Safe to advance the cursor.
-          if (!ACTIVITY_TYPES_RELEVANT.has(activity.type)) {
-            if (!dryRun) await state().bumpActivityCursor(activity);
-            lastSuccessfulActivityId = activityId;
-            continue;
+          if (activityId <= fromActivityId) {
+            // Cruzamos al territorio ya conocido: de aquí en más todo es viejo.
+            ignoredOldActivities += 1;
+            reachedKnown = true;
+            break;
           }
+          newActivities.push(activity);
+        }
 
-          // Same for malformed activities (missing property_id) — KiteProp data
-          // glitch, not a sync failure. Advance and move on.
-          const propertyId = Number(activity.property_id);
-          if (!Number.isFinite(propertyId) || propertyId <= 0) {
-            if (!dryRun) await state().bumpActivityCursor(activity);
-            lastSuccessfulActivityId = activityId;
-            continue;
-          }
+        if (reachedKnown) break;
+        // Página incompleta = última página (las actividades más viejas).
+        if (activities.length < pageSize) {
+          reachedEnd = true;
+          break;
+        }
+        page += 1;
+      }
 
-          // Process the activity. Capture the result so we can detect failures.
-          // Both `softDeleteProperty` and `syncOne` ALWAYS return (never throw):
-          //   - On success they return { status: 'ok' | 'noop', ... }
-          //   - On failure they return { status: 'error', ... } AFTER logging.
-          // We must inspect the return value to decide whether to advance the
-          // cursor — otherwise a transient HTTP/DB failure would silently lose
-          // the activity forever.
-          let activityFailed = false;
-          let activityFailureReason = null;
-          let processedThisActivity = false;
+      newActivitiesCollected = newActivities.length;
+      // Solo es seguro avanzar el cursor si vimos el conjunto completo de nuevas.
+      boundaryReached = reachedKnown || reachedEnd;
+      if (!boundaryReached) {
+        strapi.log.warn(
+          `[kiteprop-sync] runDelta: hay backlog > maxPages(${maxPages}); se procesan las nuevas recolectadas pero el cursor NO avanza esta corrida para no saltar actividades. Subir KITEPROP_SYNC_DELTA_MAX_PAGES para drenar de una vez.`
+        );
+      }
 
-          if (activity.type === ACTIVITY_TYPE_DELETE) {
-            if (!deletionsProcessed.has(propertyId)) {
-              const r = await softDeleteProperty(propertyId, { runId, dryRun, source });
-              items.push(r);
-              deletionsProcessed.add(propertyId);
-              processedThisActivity = true;
-              if (r && r.status === 'error') {
-                activityFailed = true;
-                activityFailureReason = r.message || 'softDeleteProperty returned error';
-              }
-            }
-          } else {
-            // Group changes per property within this run to avoid duplicate fetches.
-            if (!propertiesProcessed.has(propertyId) && !deletionsProcessed.has(propertyId)) {
-              const r = await syncOne(propertyId, { runId, dryRun, source, suppressDeploy: true });
-              items.push(...r.items);
-              propertiesProcessed.add(propertyId);
-              processedThisActivity = true;
-              const failedItem = (r.items || []).find((it) => it && it.status === 'error');
-              if (failedItem) {
-                activityFailed = true;
-                activityFailureReason = failedItem.message || 'syncOne returned an error item';
-              }
-            }
-          }
+      // -----------------------------------------------------------------------
+      // FASE 2 — PROCESS ascendente (cursor monotónico) con dedupe + stop-on-fail
+      // -----------------------------------------------------------------------
+      newActivities.sort((a, b) => Number(a.id) - Number(b.id));
 
-          if (activityFailed) {
-            // CRITICAL: do NOT advance the cursor. Abort the run so the next
-            // run retries from this exact activity. Idempotency in upsertProperty
-            // (`isRemoteNewer`) makes any re-processed siblings cheap on retry.
-            abortedAtActivityId = activityId;
-            lastError = new Error(
-              `Activity ${activityId} (property_id=${propertyId}, type=${activity.type}) failed: ${activityFailureReason}`
-            );
-            await logger().record({
-              run_id: runId,
-              source,
-              resource: 'property',
-              action: 'delta',
-              kiteprop_id: propertyId,
-              status: 'error',
-              message:
-                `Aborting runDelta at activity_id=${activityId} to avoid losing changes. ` +
-                `Cursor stays at ${lastSuccessfulActivityId ?? fromActivityId}. ` +
-                `Reason: ${activityFailureReason}`,
-              dry_run: dryRun,
-            });
-            break; // exit for-of (will also exit while via abortedAtActivityId guard)
-          }
+      // Solo movemos el cursor real si NO es dry-run y confirmamos contigüidad.
+      const canAdvanceCursor = !dryRun && boundaryReached;
 
-          // Success path: advance cursor (only on real runs).
-          if (!dryRun) await state().bumpActivityCursor(activity);
+      for (const activity of newActivities) {
+        const activityId = Number(activity.id);
+
+        // Tipos irrelevantes: no son fallos, solo no los procesamos. Acusables
+        // (avanzan el cursor) para no re-mirarlos.
+        if (!ACTIVITY_TYPES_RELEVANT.has(activity.type)) {
+          ignoredIrrelevantActivities += 1;
+          if (canAdvanceCursor) await state().bumpActivityCursor(activity);
           lastSuccessfulActivityId = activityId;
+          continue;
+        }
 
-          if (processedThisActivity) {
-            itemsProcessed += 1;
-            if (itemsProcessed >= maxItems) {
-              maxItemsReached = true;
-              break;
+        // Actividad mal formada (sin property_id): glitch de datos, no un fallo.
+        const propertyId = Number(activity.property_id);
+        if (!Number.isFinite(propertyId) || propertyId <= 0) {
+          if (canAdvanceCursor) await state().bumpActivityCursor(activity);
+          lastSuccessfulActivityId = activityId;
+          continue;
+        }
+
+        relevantActivities += 1;
+
+        // softDeleteProperty y syncOne SIEMPRE retornan (nunca lanzan):
+        //   - éxito  -> { status: 'ok' | 'noop', ... }
+        //   - fallo  -> { status: 'error', ... } DESPUÉS de loguear.
+        // Inspeccionamos el retorno para decidir si avanzar el cursor.
+        let activityFailed = false;
+        let activityFailureReason = null;
+        let processedThisActivity = false;
+
+        if (activity.type === ACTIVITY_TYPE_DELETE) {
+          if (!deletionsProcessed.has(propertyId)) {
+            const r = await softDeleteProperty(propertyId, { runId, dryRun, source });
+            items.push(r);
+            deletionsProcessed.add(propertyId);
+            processedThisActivity = true;
+            if (r && r.status === 'error') {
+              activityFailed = true;
+              activityFailureReason = r.message || 'softDeleteProperty returned error';
+            }
+          }
+        } else {
+          // Dedupe por property_id: una propiedad con varias actividades nuevas se
+          // sincroniza una sola vez (estado final desde KiteProp).
+          if (!propertiesProcessed.has(propertyId) && !deletionsProcessed.has(propertyId)) {
+            const r = await syncOne(propertyId, { runId, dryRun, source, suppressDeploy: true });
+            items.push(...r.items);
+            propertiesProcessed.add(propertyId);
+            processedThisActivity = true;
+            const failedItem = (r.items || []).find((it) => it && it.status === 'error');
+            if (failedItem) {
+              activityFailed = true;
+              activityFailureReason = failedItem.message || 'syncOne returned an error item';
             }
           }
         }
 
-        if (abortedAtActivityId !== null) break;
-        if (maxItemsReached) break;
-        if (!advanced) break;
-        if (activities.length < pageSize) break;
-        page += 1;
+        if (activityFailed) {
+          // No avanzar el cursor más allá de la última actividad exitosa: la
+          // próxima corrida reintenta desde aquí. La idempotencia (data_hash)
+          // hace barato re-procesar las que ya estaban OK.
+          abortedAtActivityId = activityId;
+          lastError = new Error(
+            `Activity ${activityId} (property_id=${propertyId}, type=${activity.type}) failed: ${activityFailureReason}`
+          );
+          await logger().record({
+            run_id: runId,
+            source,
+            resource: 'property',
+            action: 'delta',
+            kiteprop_id: propertyId,
+            status: 'error',
+            message:
+              `Aborting runDelta at activity_id=${activityId} to avoid losing changes. ` +
+              `Cursor stays at ${lastSuccessfulActivityId ?? fromActivityId}. ` +
+              `Reason: ${activityFailureReason}`,
+            dry_run: dryRun,
+          });
+          break;
+        }
+
+        // Éxito: avanzar cursor (solo en corridas reales y con contigüidad).
+        if (canAdvanceCursor) await state().bumpActivityCursor(activity);
+        lastSuccessfulActivityId = activityId;
+
+        if (processedThisActivity) {
+          itemsProcessed += 1;
+          if (itemsProcessed >= maxItems) break;
+        }
       }
     } catch (err) {
-      // Errors here come from listActivities (HTTP transport) or any unexpected
-      // throw. Either way: do NOT advance any cursor beyond what was already
-      // committed item-by-item (we already only commit on success).
+      // Errores de listActivities (transporte) o cualquier throw inesperado.
+      // No avanzamos cursor más allá de lo ya commiteado item-a-item.
       lastError = err;
       strapi.log.error(`[kiteprop-sync] runDelta error: ${err.message}`);
     } finally {
-      // Lock + last_run_at / last_success_at / last_error are written only on
-      // real runs. Dry-run leaves sync-state untouched.
       if (!dryRun) {
         await state().releaseLock({ success: !lastError, error: lastError });
       }
     }
 
+    // El cursor real solo cambió si NO fue dry-run y hubo contigüidad confirmada.
+    const finalCursor =
+      !dryRun && boundaryReached && lastSuccessfulActivityId !== null
+        ? lastSuccessfulActivityId
+        : fromActivityId;
+
     const summary = summarize(items);
     summary.activities_seen = activitiesSeen;
     summary.items_processed = itemsProcessed;
     summary.max_items = maxItems;
+    summary.pages_read = pagesRead;
+    summary.new_activities_collected = newActivitiesCollected;
+    summary.relevant_activities = relevantActivities;
+    summary.ignored_old_activities = ignoredOldActivities;
+    summary.ignored_irrelevant_activities = ignoredIrrelevantActivities;
+    summary.boundary_reached = boundaryReached;
+    summary.from_activity_id = fromActivityId;
+    summary.final_cursor = finalCursor;
     summary.last_successful_activity_id = lastSuccessfulActivityId;
     summary.aborted_at_activity_id = abortedAtActivityId;
 
@@ -1121,7 +1186,12 @@ module.exports = ({ strapi: _strapi } = {}) => {
       resource: 'property',
       action: 'delta',
       status: lastError ? 'error' : 'ok',
-      message: `runDelta finished — ${JSON.stringify(summary)}`,
+      message:
+        `runDelta finished — fromActivityId=${fromActivityId} pagesRead=${pagesRead} ` +
+        `activitiesSeen=${activitiesSeen} newActivitiesCollected=${newActivitiesCollected} ` +
+        `relevantActivities=${relevantActivities} ignoredOldActivities=${ignoredOldActivities} ` +
+        `ignoredIrrelevantActivities=${ignoredIrrelevantActivities} itemsProcessed=${itemsProcessed} ` +
+        `boundaryReached=${boundaryReached} finalCursor=${finalCursor} ${JSON.stringify(summary)}`,
       error_details: lastError ? { message: lastError.message } : null,
       dry_run: dryRun,
       duration_ms: Date.now() - startedAt,
