@@ -26,7 +26,20 @@ function isCronEnabled() {
   return String(process.env.CRON_ENABLED || 'false').toLowerCase() === 'true';
 }
 
+function isKitepropAutoSyncEnabled() {
+  return String(process.env.KITEPROP_AUTO_SYNC_ENABLED || 'false').toLowerCase() === 'true';
+}
+
 function startKitepropSyncInterval() {
+  // Si el auto-sync interno está activo, es la vía PRINCIPAL: no levantamos el
+  // interval legacy en el mismo proceso para no duplicar timers (el lock del
+  // sync-state igual evitaría doble corrida, pero esto es más limpio).
+  if (isKitepropAutoSyncEnabled()) {
+    strapi.log.info(
+      '[kiteprop-sync][interval] legacy omitido: KITEPROP_AUTO_SYNC_ENABLED=true (se usa el auto-sync interno)'
+    );
+    return;
+  }
   if (!isKitepropSyncEnabled()) return;
   if (String(process.env.KITEPROP_SYNC_INTERVAL_DISABLED || 'false').toLowerCase() === 'true') return;
   // El cron de Strapi es la FUENTE PRINCIPAL de ejecución. Si CRON_ENABLED=true,
@@ -64,6 +77,17 @@ function startKitepropSyncInterval() {
   global[KITEPROP_INTERVAL_KEY] = setInterval(runIntervalSync, intervalMs);
   global[KITEPROP_INTERVAL_KEY].unref?.();
   setTimeout(runIntervalSync, 60 * 1000).unref?.();
+}
+
+function startKitepropAutoSync() {
+  // Vía PRINCIPAL recomendada en Strapi Cloud: intervalo interno independiente
+  // del cron nativo de Strapi y de GitHub Actions. Si está deshabilitado por
+  // ENV, el propio servicio loguea y no hace nada.
+  try {
+    strapi.service('api::kiteprop-sync.auto-sync').start();
+  } catch (err) {
+    strapi.log.error(`[kiteprop-auto-sync] no se pudo iniciar el interval interno: ${err.message}`);
+  }
 }
 
 async function clearStaleDeployState() {
@@ -345,4 +369,5 @@ module.exports = async () => {
   // de lo contrario el coordinador podría no volver a deployar nunca.
   await clearStaleDeployState();
   startKitepropSyncInterval();
+  startKitepropAutoSync();
 };

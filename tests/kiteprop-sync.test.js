@@ -74,6 +74,11 @@ function loadFrontendDeployService() {
   return require('../src/api/kiteprop-sync/services/frontend-deploy')({});
 }
 
+function loadAutoSyncService() {
+  delete require.cache[require.resolve('../src/api/kiteprop-sync/services/auto-sync')];
+  return require('../src/api/kiteprop-sync/services/auto-sync')({});
+}
+
 function loadController() {
   delete require.cache[require.resolve('../src/api/kiteprop-sync/controllers/kiteprop-sync')];
   return require('../src/api/kiteprop-sync/controllers/kiteprop-sync');
@@ -144,6 +149,7 @@ function installStrapiMock(options = {}) {
     infoLogs: [],
     warnLogs: [],
     errorLogs: [],
+    serviceRequests: [],
   };
 
   let currentProperty = options.existingProperty || null;
@@ -308,6 +314,7 @@ function installStrapiMock(options = {}) {
       };
     },
     service(uid) {
+      calls.serviceRequests.push(uid);
       if (uid === 'api::kiteprop-sync.logger') {
         return {
           async record(entry) {
@@ -320,6 +327,9 @@ function installStrapiMock(options = {}) {
       if (uid === 'api::kiteprop-sync.reconciliation') return loadReconciliationService();
       if (uid === 'api::kiteprop-sync.mapping-audit') return loadMappingAuditService();
       if (uid === 'api::kiteprop-sync.frontend-deploy') return loadFrontendDeployService();
+      if (uid === 'api::kiteprop-sync.properties-sync') {
+        return options.syncServiceOverride || loadService();
+      }
       throw new Error(`Unexpected service ${uid}`);
     },
     store() {
@@ -356,6 +366,12 @@ test.beforeEach(() => {
   delete process.env.FRONTEND_DEPLOY_MIN_INTERVAL_MS;
   delete process.env.FRONTEND_DEPLOY_REASON_LOG;
   delete process.env.FRONTEND_DEPLOY_TIMEOUT_MS;
+  delete process.env.KITEPROP_AUTO_SYNC_ENABLED;
+  delete process.env.KITEPROP_AUTO_SYNC_MODE;
+  delete process.env.KITEPROP_AUTO_SYNC_INTERVAL_MS;
+  delete process.env.KITEPROP_AUTO_SYNC_MAX_PAGES;
+  delete process.env.KITEPROP_AUTO_SYNC_MAX_ITEMS;
+  delete process.env.KITEPROP_AUTO_SYNC_DRY_RUN;
 });
 
 test('mapper assigns UF sale price only to Precio', () => {
@@ -2391,4 +2407,196 @@ test('reconcile keeps successful changes and leaves pending_deploy when a proper
   assert.equal(fetchCalls.length, 0);
   // ...queda pendiente para la próxima corrida segura.
   assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+});
+
+// ---------------------------------------------------------------------------
+// Auto-sync interno (intervalo seguro para Strapi Cloud)
+// ---------------------------------------------------------------------------
+
+function makeSyncSpy(resultByMethod = {}) {
+  const calls = { runReconcile: [], runAll: [] };
+  return {
+    calls,
+    async runReconcile(opts) {
+      calls.runReconcile.push(opts);
+      return resultByMethod.runReconcile || { summary: { created: 0, updated: 0, skipped: 0, errors: 0 } };
+    },
+    async runAll(opts) {
+      calls.runAll.push(opts);
+      return (
+        resultByMethod.runAll || {
+          ok: true,
+          combined: { summary: { created: 0, updated: 0, skipped: 0, errors: 0 } },
+        }
+      );
+    },
+  };
+}
+
+test('auto-sync deshabilitado no ejecuta nada', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'false';
+  const syncSpy = makeSyncSpy();
+  installStrapiMock({ syncServiceOverride: syncSpy, state: { is_running: false } });
+  const autoSync = loadAutoSyncService();
+
+  const result = await autoSync.runOnce({ source: 'test' });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, 'disabled');
+  assert.equal(syncSpy.calls.runReconcile.length, 0);
+  assert.equal(syncSpy.calls.runAll.length, 0);
+});
+
+test('auto-sync enabled + mode=reconcile llama runReconcile', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'reconcile';
+  const syncSpy = makeSyncSpy();
+  installStrapiMock({ syncServiceOverride: syncSpy, state: { is_running: false } });
+  const autoSync = loadAutoSyncService();
+
+  const result = await autoSync.runOnce({ source: 'test' });
+
+  assert.equal(result.skipped, false);
+  assert.equal(result.mode, 'reconcile');
+  assert.equal(syncSpy.calls.runReconcile.length, 1);
+  assert.equal(syncSpy.calls.runAll.length, 0);
+});
+
+test('auto-sync enabled + mode=delta llama runAll', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'delta';
+  const syncSpy = makeSyncSpy();
+  installStrapiMock({ syncServiceOverride: syncSpy, state: { is_running: false } });
+  const autoSync = loadAutoSyncService();
+
+  const result = await autoSync.runOnce({ source: 'test' });
+
+  assert.equal(result.skipped, false);
+  assert.equal(result.mode, 'delta');
+  assert.equal(syncSpy.calls.runAll.length, 1);
+  assert.equal(syncSpy.calls.runReconcile.length, 0);
+});
+
+test('auto-sync respeta dryRun/maxPages/maxItems desde ENV', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'reconcile';
+  process.env.KITEPROP_AUTO_SYNC_DRY_RUN = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MAX_PAGES = '7';
+  process.env.KITEPROP_AUTO_SYNC_MAX_ITEMS = '33';
+  const syncSpy = makeSyncSpy();
+  installStrapiMock({ syncServiceOverride: syncSpy, state: { is_running: false } });
+  const autoSync = loadAutoSyncService();
+
+  await autoSync.runOnce({ source: 'test' });
+
+  const opts = syncSpy.calls.runReconcile[0];
+  assert.equal(opts.dryRun, true);
+  assert.equal(opts.maxPages, 7);
+  assert.equal(opts.maxItems, 33);
+});
+
+test('auto-sync no corre si el sync-state indica is_running=true', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'reconcile';
+  const syncSpy = makeSyncSpy();
+  installStrapiMock({
+    syncServiceOverride: syncSpy,
+    state: { is_running: true, current_run_id: 'run-en-curso' },
+  });
+  const autoSync = loadAutoSyncService();
+
+  const result = await autoSync.runOnce({ source: 'test' });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, 'sync_in_progress');
+  assert.equal(syncSpy.calls.runReconcile.length, 0);
+  assert.equal(syncSpy.calls.runAll.length, 0);
+});
+
+test('auto-sync NO toca el coordinador de deploy (delega en el sync)', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'reconcile';
+  const syncSpy = makeSyncSpy();
+  const calls = installStrapiMock({ syncServiceOverride: syncSpy, state: { is_running: false } });
+  const autoSync = loadAutoSyncService();
+
+  await autoSync.runOnce({ source: 'test' });
+
+  // El auto-sync nunca pide directamente el servicio frontend-deploy: el deploy
+  // lo decide internamente runReconcile/runAll (1 deploy al final si corresponde).
+  assert.equal(calls.serviceRequests.includes('api::kiteprop-sync.frontend-deploy'), false);
+});
+
+test('auto-sync (reconcile real) no deploya cuando no hubo cambios reales', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'reconcile';
+  process.env.KITEPROP_AUTO_SYNC_DRY_RUN = 'false';
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const kp101 = sampleProperty({ id: 101, address: 'Calle 1' });
+  const kp102 = sampleProperty({ id: 102, address: 'Calle 2' });
+  installStrapiMock({
+    state: { is_running: false, last_activity_id: 0, last_max_property_id: 0 },
+    propertyList: [{ id: 101 }, { id: 102 }],
+    properties: { 101: kp101, 102: kp102 },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101),
+      102: localPropertyFromKiteProp(kp102),
+    },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const autoSync = loadAutoSyncService();
+
+  const result = await autoSync.runOnce({ source: 'test' });
+
+  assert.equal(result.skipped, false);
+  assert.equal(result.result.summary.created, 0);
+  assert.equal(result.result.summary.updated, 0);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('auto-sync (reconcile real) hace 1 solo deploy al final cuando hubo cambios', async () => {
+  process.env.KITEPROP_AUTO_SYNC_ENABLED = 'true';
+  process.env.KITEPROP_AUTO_SYNC_MODE = 'reconcile';
+  process.env.KITEPROP_AUTO_SYNC_DRY_RUN = 'false';
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const kp101 = sampleProperty({ id: 101, address: 'Calle 1' });
+  const kp102 = sampleProperty({ id: 102, address: 'Calle 2' });
+  const calls = installStrapiMock({
+    state: { is_running: false, last_activity_id: 0, last_max_property_id: 0 },
+    propertyList: [{ id: 101 }, { id: 102 }],
+    properties: { 101: kp101, 102: kp102 },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101, { kiteprop_data_hash: 'old' }),
+      102: localPropertyFromKiteProp(kp102, { kiteprop_data_hash: 'old' }),
+    },
+  });
+  const deploySnapshots = [];
+  global.fetch = async () => {
+    deploySnapshots.push({ propertyUpdates: calls.propertyUpdates.length });
+    return { ok: true, status: 200 };
+  };
+  const autoSync = loadAutoSyncService();
+
+  const result = await autoSync.runOnce({ source: 'test' });
+
+  assert.equal(result.result.summary.updated, 2);
+  // Un único deploy, disparado DESPUÉS de aplicar las 2 actualizaciones.
+  assert.equal(deploySnapshots.length, 1);
+  assert.equal(deploySnapshots[0].propertyUpdates, 2);
+});
+
+test('auto-sync default seguro: enabled=false y dryRun=true', () => {
+  const cfg = loadAutoSyncService().getConfig();
+
+  assert.equal(cfg.enabled, false);
+  assert.equal(cfg.dryRun, true);
+  assert.equal(cfg.mode, 'reconcile');
 });
