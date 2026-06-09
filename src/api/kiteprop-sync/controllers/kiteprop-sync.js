@@ -13,6 +13,7 @@
  *   POST   /kiteprop-sync/properties/run-sniffer   (id-desc sniffer for new entries)
  *   POST   /kiteprop-sync/properties/run-all       (delta + sniffer in one call)
  *   POST   /kiteprop-sync/properties/run-next      (one changed/new property)
+ *   POST   /kiteprop-sync/properties/reconcile     (full backfill; dryRun-first, 1 deploy at end)
  *   GET    /kiteprop-sync/reconciliation/summary   (read-only ID audit)
  *   GET    /kiteprop-sync/reconciliation/mapping-audit (read-only mapping audit)
  *   GET    /kiteprop-sync/state                    (read sync-state)
@@ -192,6 +193,30 @@ module.exports = {
     });
     ctx.status = result.ok ? 200 : 500;
     ctx.body = result;
+  },
+
+  /**
+   * Full reconciliation / backfill: KiteProp -> Strapi.
+   * Re-syncs the whole catalog (paginated, conservative). Idempotent: only writes
+   * properties that actually differ, and triggers at most ONE deploy at the end.
+   *
+   * Body: { dryRun?: boolean, status?: string, order?: string, maxPages?: number, maxItems?: number }
+   * Defaults to dry-run (KITEPROP_SYNC_DRY_RUN) so a real backfill must be opt-in.
+   */
+  async reconcile(ctx) {
+    const dryRun = resolveDryRun(ctx);
+    const body = ctx.request.body || {};
+    const sync = strapi.service('api::kiteprop-sync.properties-sync');
+    const result = await sync.runReconcile({
+      dryRun,
+      source: 'manual:reconcile',
+      status: typeof body.status === 'string' && body.status.trim() ? body.status.trim() : undefined,
+      order: typeof body.order === 'string' && body.order.trim() ? body.order.trim() : undefined,
+      maxPages: body.maxPages ? Number(body.maxPages) : undefined,
+      maxItems: body.maxItems ? Number(body.maxItems) : undefined,
+    });
+    ctx.status = result.error ? 500 : 200;
+    ctx.body = { ok: !result.error, dry_run: dryRun, result };
   },
 
   /**

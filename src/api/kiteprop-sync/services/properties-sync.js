@@ -9,7 +9,8 @@
  *   syncOne(id, opts)       — sync a single KiteProp property by id (manual / on demand).
  *   runDelta(opts)          — walk /properties/activities since the stored cursor.
  *   runSniffer(opts)        — detect newly created properties via /properties?order=id:desc.
- *   reconcile(opts)         — (TODO Phase 1.x) full reconciliation pass; not yet implemented.
+ *   runReconcile(opts)      — full backfill/reconciliation pass (paginated, dryRun-first,
+ *                             idempotent via syncOne, single grouped deploy at the end).
  *
  * Behaviors enforced here:
  *   - Soft delete only. Never hard delete (per Phase 1 rules).
@@ -1555,6 +1556,235 @@ module.exports = ({ strapi: _strapi } = {}) => {
     return { ok: !combined.error, dry_run: dryRun, delta, sniffer, combined };
   }
 
+  /**
+   * Reconciliación completa / backfill: KiteProp -> Strapi.
+   *
+   * POR QUÉ EXISTE (además de runDelta):
+   *   runDelta sólo mira /properties/activities desde el cursor. Tras un cambio de
+   *   mapeo, o tras un periodo en que el delta estuvo fallando, hay propiedades
+   *   ANTIGUAS que quedaron desalineadas y que el delta NO vuelve a tocar (no
+   *   generan actividad nueva). runReconcile recorre el catálogo completo de
+   *   KiteProp de forma paginada y conservadora, y re-sincroniza cada propiedad
+   *   REUTILIZANDO syncOne, que ya es idempotente: sólo escribe en Strapi si el
+   *   data_hash / images_hash / updated_at cambió de verdad.
+   *
+   * Garantías (alineadas con las reglas del coordinador de deploy):
+   *   - dryRun (por defecto true): NO escribe en Strapi, NO avanza cursores, NO
+   *     marca pending_deploy, NO llama a Cloudflare; sólo informa cuántas
+   *     propiedades cambiarían (summary.created / summary.updated).
+   *   - En ejecución real: lista paginado, compara con el mapper actual (vía
+   *     syncOne -> upsertProperty), actualiza sólo si hay diferencias reales,
+   *     crea si falta en Strapi, y gatilla 1 SOLO deploy al final si hubo cambios
+   *     reales (nunca uno por propiedad: usa suppressDeploy en cada syncOne).
+   *   - Dedupe por kiteprop_id.
+   *   - Límites duros: maxPages y maxItems.
+   *   - NO toca los cursores de delta/sniffer -> no rompe runDelta ni runSniffer.
+   *   - NO hace soft-delete: la política de Fase 1 reserva el borrado para la
+   *     actividad delete_property. Una propiedad ausente del listado `active`
+   *     puede estar inactive/sold (no borrada), así que NO es seguro despublicar
+   *     desde aquí. Las desalineaciones de "extra en Strapi" se diagnostican con
+   *     el endpoint read-only reconciliation/summary.
+   *
+   * Resiliencia ante errores (regla: no seguir ciegamente si causa inconsistencias):
+   *   - Cada propiedad es independiente e idempotente: si una falla, syncOne ya la
+   *     aísla (devuelve item con status 'error', NUNCA lanza) y seguimos con las
+   *     demás SIN perder los cambios ya aplicados.
+   *   - Si listProperties falla (no podemos seguir paginando con garantías), se
+   *     corta la paginación y se procesa sólo lo ya recolectado.
+   *   - Si hubo cambios reales pero también errores, NO deployamos en el acto:
+   *     dejamos pending_deploy con la lógica existente para reintentar en la
+   *     próxima corrida segura.
+   */
+  async function runReconcile(opts = {}) {
+    const runId = opts.runId || newRunId();
+    // dryRun por defecto = true (seguridad): sólo escribe si se pide explícito.
+    const dryRun = opts.dryRun === undefined ? true : !!opts.dryRun;
+    const source = opts.source || 'runReconcile';
+    const startedAt = Date.now();
+    const status = opts.status || 'active';
+    const order = opts.order || 'id:asc';
+    // KiteProp documenta sólo 15/30/50 para el listado; topamos en 50.
+    const pageSize = Math.min(readEnvNumber('KITEPROP_SYNC_PAGE_SIZE_PROPERTIES', 50), 50);
+    const maxPages = readPositiveNumber(
+      opts.maxPages,
+      readEnvNumber('KITEPROP_SYNC_RECONCILE_MAX_PAGES', 50)
+    );
+    const maxItems = readPositiveNumber(
+      opts.maxItems,
+      readEnvNumber('KITEPROP_SYNC_RECONCILE_MAX_ITEMS', 1000)
+    );
+
+    // Dry-run es estrictamente read-only: no tomamos el lock ni tocamos estado.
+    if (!dryRun) {
+      const lock = await state().acquireLock(runId);
+      if (!lock.acquired) {
+        strapi.log.warn(`[kiteprop-sync] runReconcile skipped: ${lock.reason}`);
+        return {
+          run_id: runId,
+          dry_run: dryRun,
+          skipped: true,
+          reason: lock.reason,
+          duration_ms: Date.now() - startedAt,
+        };
+      }
+    }
+
+    const items = [];
+    const seenIds = new Set();
+    let pagesRead = 0;
+    let propertiesSeen = 0;
+    let stoppedAtMaxPages = false;
+    let stoppedAtMaxItems = false;
+    let lastError = null;
+
+    try {
+      await logger().record({
+        run_id: runId,
+        source,
+        resource: 'property',
+        action: 'reconcile',
+        status: 'ok',
+        message:
+          `start runReconcile status=${status} order=${order} maxPages=${maxPages} ` +
+          `maxItems=${maxItems} pageSize=${pageSize}` +
+          `${dryRun ? ' (dry-run: NO writes, NO deploy, NO cursor)' : ''}`,
+        dry_run: dryRun,
+      });
+
+      // -----------------------------------------------------------------------
+      // FASE 1 — COLLECT ids paginando, deduplicando por kiteprop_id.
+      // -----------------------------------------------------------------------
+      const candidateIds = [];
+      let page = 1;
+      while (page <= maxPages) {
+        let res;
+        try {
+          res = await client().listProperties({ page, limit: pageSize, order, status });
+        } catch (err) {
+          lastError = err;
+          strapi.log.error(
+            `[kiteprop-sync] runReconcile list error on page ${page}: ${err.message}`
+          );
+          break;
+        }
+        const list = res?.data?.data || [];
+        pagesRead += 1;
+        if (list.length === 0) break;
+
+        for (const remote of list) {
+          propertiesSeen += 1;
+          const remoteId = Number(remote?.id);
+          if (!Number.isFinite(remoteId) || remoteId <= 0) continue;
+          if (seenIds.has(remoteId)) continue; // dedupe por kiteprop_id
+          seenIds.add(remoteId);
+          candidateIds.push(remoteId);
+        }
+
+        // Página incompleta = última página del catálogo.
+        if (list.length < pageSize) break;
+        if (page >= maxPages) {
+          stoppedAtMaxPages = true;
+          break;
+        }
+        page += 1;
+      }
+
+      // Tope duro por maxItems (sobre ids únicos ya deduplicados).
+      let idsToProcess = candidateIds;
+      if (candidateIds.length > maxItems) {
+        stoppedAtMaxItems = true;
+        idsToProcess = candidateIds.slice(0, maxItems);
+      }
+
+      await logger().record({
+        run_id: runId,
+        source,
+        resource: 'property',
+        action: 'reconcile',
+        status: 'ok',
+        message:
+          `collected ${candidateIds.length} unique id(s) across ${pagesRead} page(s); ` +
+          `processing ${idsToProcess.length}` +
+          `${stoppedAtMaxPages ? ' (stopped at maxPages)' : ''}` +
+          `${stoppedAtMaxItems ? ' (capped at maxItems)' : ''}`,
+        dry_run: dryRun,
+      });
+
+      // -----------------------------------------------------------------------
+      // FASE 2 — PROCESS reutilizando syncOne (idempotente, sin deploy por item).
+      // -----------------------------------------------------------------------
+      for (const id of idsToProcess) {
+        const r = await syncOne(id, { runId, dryRun, source, suppressDeploy: true });
+        items.push(...r.items);
+
+        const failedItem = (r.items || []).find((it) => it && it.status === 'error');
+        if (failedItem) {
+          // Resiliente: la propiedad falló pero está aislada (idempotente). No
+          // abortamos la corrida; registramos el error para diferir el deploy.
+          lastError =
+            lastError ||
+            new Error(`property ${id} failed during reconcile: ${failedItem.message || 'see logs'}`);
+        }
+      }
+    } catch (err) {
+      lastError = err;
+      strapi.log.error(`[kiteprop-sync] runReconcile error: ${err.message}`);
+    } finally {
+      if (!dryRun) {
+        await state().releaseLock({ success: !lastError, error: lastError });
+      }
+    }
+
+    const summary = summarize(items);
+    summary.pages_read = pagesRead;
+    summary.properties_seen = propertiesSeen;
+    summary.unique_candidates = seenIds.size;
+    summary.processed = items.length;
+    summary.max_pages = maxPages;
+    summary.max_items = maxItems;
+    summary.stopped_at_max_pages = stoppedAtMaxPages;
+    summary.stopped_at_max_items = stoppedAtMaxItems;
+    summary.dry_run = dryRun;
+
+    await logger().record({
+      run_id: runId,
+      source,
+      resource: 'property',
+      action: 'reconcile',
+      status: lastError ? 'error' : 'ok',
+      message:
+        `runReconcile finished — dryRun=${dryRun} pagesRead=${pagesRead} ` +
+        `propertiesSeen=${propertiesSeen} created=${summary.created} updated=${summary.updated} ` +
+        `skipped=${summary.skipped} errors=${summary.errors} ${JSON.stringify(summary)}`,
+      error_details: lastError ? { message: lastError.message } : null,
+      dry_run: dryRun,
+      duration_ms: Date.now() - startedAt,
+    });
+
+    const result = {
+      run_id: runId,
+      dry_run: dryRun,
+      summary,
+      items,
+      error: lastError ? lastError.message : null,
+      duration_ms: Date.now() - startedAt,
+    };
+
+    // 1 SOLO deploy al final. El coordinador:
+    //   - dry-run -> no deploya ni marca pendiente (early-return interno).
+    //   - cambios reales sin error -> deploya una vez (respetando debounce).
+    //   - cambios reales con error -> deja pending_deploy para reintentar luego.
+    //   - sin cambios reales -> no deploya (sólo drena un pendiente previo).
+    if (!opts.suppressDeploy) {
+      await maybeTriggerFrontendDeploy(result, {
+        reason: 'runReconcile real property changes',
+        source,
+        runId,
+      });
+    }
+    return result;
+  }
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -1661,6 +1891,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     runNext: withSyncWrites(runNext),
     runAll: withSyncWrites(runAll),
     runInterval: withSyncWrites(runInterval),
+    runReconcile: withSyncWrites(runReconcile),
     // Internal helpers exposed for testing/ops
     _internal: {
       upsertProperty,
