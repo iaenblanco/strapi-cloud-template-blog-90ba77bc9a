@@ -131,6 +131,8 @@ function installStrapiMock(options = {}) {
   const calls = {
     propertyCreates: [],
     propertyUpdates: [],
+    propertyCreateStatuses: [],
+    propertyUpdateStatuses: [],
     propertyUnpublishes: [],
     imageCreates: [],
     imageUpdates: [],
@@ -170,12 +172,14 @@ function installStrapiMock(options = {}) {
       }
       return currentProperty;
     },
-    async create({ data }) {
+    async create({ status, data }) {
+      calls.propertyCreateStatuses.push(status);
       calls.propertyCreates.push(data);
       currentProperty = { id: 1, documentId: 'prop-created', ...data };
       return currentProperty;
     },
-    async update({ documentId, data }) {
+    async update({ documentId, status, data }) {
+      calls.propertyUpdateStatuses.push(status);
       calls.propertyUpdates.push({ documentId, data });
       currentProperty = { ...(currentProperty || {}), documentId, ...data };
       return currentProperty;
@@ -2273,6 +2277,49 @@ test('reconcile real updates only properties with real differences', async () =>
   // No toca cursores de delta/sniffer.
   assert.equal(calls.bumpActivityCursor.length, 0);
   assert.equal(calls.bumpMaxPropertyId.length, 0);
+});
+
+test('reconcile marks local property missing from active set as Publicado=false but keeps it published in Strapi', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp101 = sampleProperty({ id: 101, status: 'active', address: 'Calle Activa' });
+  const kp202ActiveLocal = sampleProperty({ id: 202, status: 'active', address: 'Calle Sale Active' });
+  const kp202InactiveRemote = sampleProperty({
+    id: 202,
+    status: 'inactive',
+    address: 'Calle Sale Active',
+    updated_at: '2026-05-02T10:00:00.000000Z',
+  });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 101 }],
+    properties: {
+      101: kp101,
+      202: kp202InactiveRemote,
+    },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101),
+      202: localPropertyFromKiteProp(kp202ActiveLocal),
+    },
+    strapiRows: [
+      { id: 1, documentId: 'prop-101', kiteprop_id: 101, kiteprop_status: 'active', Publicado: true },
+      { id: 2, documentId: 'prop-202', kiteprop_id: 202, kiteprop_status: 'active', Publicado: true },
+    ],
+  });
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-missing-active', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.updated, 1);
+  assert.equal(result.summary.inactive_candidates, 1);
+  assert.equal(calls.propertyUpdates.length, 1);
+  assert.equal(calls.propertyUpdateStatuses[0], 'published');
+  assert.equal(calls.propertyUnpublishes.length, 0);
+  assert.equal(calls.propertyUpdates[0].documentId, 'prop-202');
+  assert.equal(calls.propertyUpdates[0].data.Publicado, false);
+  assert.equal(calls.propertyUpdates[0].data.kiteprop_status, 'inactive');
+  assert.equal(calls.propertyUpdates[0].data.kiteprop_raw.status, 'inactive');
+  assert.equal(calls.propertyUpdates[0].data.kiteprop_sync_status, 'ok');
+  assert.ok(calls.propertyUpdates[0].data.kiteprop_synced_at);
+  assert.ok(calls.propertyUpdates[0].data.kiteprop_last_synced_at);
 });
 
 test('reconcile real creates properties missing in Strapi', async () => {

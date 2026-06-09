@@ -179,15 +179,17 @@ function mapKitepropImagenes(images_list) {
 }
 
 // ---------------------------------------------------------------------------
-// Status / publishedAt
+// Status / visibility
 // ---------------------------------------------------------------------------
 
 /**
  * KiteProp status → Strapi `Publicado` boolean + lifecycle.
  *
- * "Publicado" in Strapi means the property is visible publicly. We map only
- * `status === 'active'` to true. For "active_unpublished" we set Publicado=false.
- * The full KiteProp status string is preserved in `kiteprop_status`.
+ * All KiteProp-synced properties stay in Strapi's published document state.
+ * Website visibility is controlled exclusively by `Publicado`: only
+ * `status === 'active'` maps to true. For "active_unpublished" and every other
+ * non-active status we set Publicado=false. The full KiteProp status string is
+ * preserved in `kiteprop_status`.
  */
 function isPublishedFromStatus(kpStatus) {
   return String(kpStatus || '').toLowerCase() === 'active';
@@ -279,7 +281,7 @@ function mapPropertyToStrapi(kp) {
  * Build the Strapi payload to apply when KiteProp reports a deletion.
  * Phase 1 policy = soft delete only:
  *   - Publicado = false
- *   - Strapi publication state is handled by the sync service with unpublish()
+ *   - Strapi publication state is handled by the sync service
  *   - kiteprop_status = "deleted"
  *
  * Other fields are NOT touched, so manually enriched data survives.

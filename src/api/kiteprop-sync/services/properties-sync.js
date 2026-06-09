@@ -29,6 +29,7 @@ const mime = require('mime-types');
 
 const PROPIEDAD_UID = 'api::propiedad.propiedad';
 const KITEPROP_IMAGE_UID = 'api::kiteprop-image.kiteprop-image';
+const STRAPI_LOCAL_PAGE_SIZE = 200;
 
 const ACTIVITY_TYPE_DELETE = 'delete_property';
 const ACTIVITY_TYPES_RELEVANT = new Set([
@@ -377,27 +378,94 @@ module.exports = ({ strapi: _strapi } = {}) => {
     return stats;
   }
 
-  async function writeProperty({ existing, payload, publish }) {
+  async function writeProperty({ existing, payload }) {
     const data = { ...payload };
 
     if (!existing) {
       return docs().create({
-        status: publish ? 'published' : 'draft',
+        status: 'published',
         data,
       });
     }
 
-    const updated = await docs().update({
+    return docs().update({
       documentId: existing.documentId,
-      status: publish ? 'published' : 'draft',
+      status: 'published',
       data,
     });
+  }
 
-    if (!publish) {
-      await docs().unpublish({ documentId: existing.documentId });
+  async function findPublishedLocalKitepropProperties() {
+    const rows = [];
+
+    for (let offset = 0; ; offset += STRAPI_LOCAL_PAGE_SIZE) {
+      const page = await strapi.db.query(PROPIEDAD_UID).findMany({
+        where: {
+          kiteprop_id: { $notNull: true },
+          Publicado: true,
+        },
+        select: ['id', 'documentId', 'kiteprop_id', 'kiteprop_status', 'Publicado'],
+        limit: STRAPI_LOCAL_PAGE_SIZE,
+        offset,
+        orderBy: { id: 'asc' },
+      });
+      const items = Array.isArray(page) ? page : [];
+      rows.push(...items);
+      if (items.length < STRAPI_LOCAL_PAGE_SIZE) break;
     }
 
-    return updated;
+    const byDocument = new Map();
+    for (const row of rows) {
+      if (row?.Publicado !== true) continue;
+      const kitepropId = Number(row?.kiteprop_id);
+      if (!Number.isFinite(kitepropId) || kitepropId <= 0) continue;
+      const key = row?.documentId || String(row?.id || kitepropId);
+      if (!byDocument.has(key)) byDocument.set(key, { ...row, kiteprop_id: kitepropId });
+    }
+
+    return Array.from(byDocument.values());
+  }
+
+  async function reconcileLocalsMissingFromActiveSet({ activeIds, ctx }) {
+    const startedAt = Date.now();
+    const localPublished = await findPublishedLocalKitepropProperties();
+    const missingFromActive = localPublished.filter((row) => !activeIds.has(Number(row.kiteprop_id)));
+
+    await logger().record({
+      run_id: ctx.runId,
+      source: ctx.source,
+      resource: 'property',
+      action: 'reconcile_inactive',
+      status: 'ok',
+      message:
+        `found ${missingFromActive.length} local published KiteProp propert(ies) ` +
+        'absent from active set',
+      dry_run: !!ctx.dryRun,
+      duration_ms: Date.now() - startedAt,
+    });
+
+    const items = [];
+    let firstError = null;
+
+    for (const row of missingFromActive) {
+      const r = await syncOne(row.kiteprop_id, {
+        runId: ctx.runId,
+        dryRun: ctx.dryRun,
+        source: `${ctx.source}:inactive`,
+        suppressDeploy: true,
+      });
+      items.push(...(r.items || []));
+
+      const failedItem = (r.items || []).find((it) => it && it.status === 'error');
+      if (failedItem && !firstError) {
+        firstError = new Error(
+          `property ${row.kiteprop_id} failed during inactive reconcile: ` +
+            `${failedItem.message || 'see logs'}`
+        );
+      }
+    }
+
+    return { items, error: firstError, candidates: missingFromActive.length };
   }
 
   /**
@@ -541,7 +609,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       if (existing?.documentId) {
         await docs().update({
           documentId: existing.documentId,
-          status: 'draft',
+          status: 'published',
           data: {
             kiteprop_sync_status: 'error',
             kiteprop_sync_error: String(err.message).slice(0, 1000),
@@ -597,7 +665,6 @@ module.exports = ({ strapi: _strapi } = {}) => {
         const created = await writeProperty({
           existing: null,
           payload: writePayload,
-          publish: !!payload.Publicado,
         });
         await logger().record({
           run_id: runId,
@@ -646,7 +713,6 @@ module.exports = ({ strapi: _strapi } = {}) => {
       const updated = await writeProperty({
         existing,
         payload: writePayload,
-        publish: !!payload.Publicado,
       });
       await logger().record({
         run_id: runId,
@@ -1581,9 +1647,10 @@ module.exports = ({ strapi: _strapi } = {}) => {
    *   - NO toca los cursores de delta/sniffer -> no rompe runDelta ni runSniffer.
    *   - NO hace soft-delete: la política de Fase 1 reserva el borrado para la
    *     actividad delete_property. Una propiedad ausente del listado `active`
-   *     puede estar inactive/sold (no borrada), así que NO es seguro despublicar
-   *     desde aquí. Las desalineaciones de "extra en Strapi" se diagnostican con
-   *     el endpoint read-only reconciliation/summary.
+   *     puede estar inactive/sold (no borrada), así que se mantiene published en
+   *     Strapi, se actualiza su status real y se apaga `Publicado`.
+   *   - NO llama documents().unpublish() para propiedades que dejaron de estar
+   *     active; la visibilidad pública depende del campo `Publicado`.
    *
    * Resiliencia ante errores (regla: no seguir ciegamente si causa inconsistencias):
    *   - Cada propiedad es independiente e idempotente: si una falla, syncOne ya la
@@ -1635,7 +1702,10 @@ module.exports = ({ strapi: _strapi } = {}) => {
     let propertiesSeen = 0;
     let stoppedAtMaxPages = false;
     let stoppedAtMaxItems = false;
+    let inactive_candidates = 0;
+    let skippedInactiveReconcile = false;
     let lastError = null;
+    let listError = null;
 
     try {
       await logger().record({
@@ -1661,6 +1731,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
         try {
           res = await client().listProperties({ page, limit: pageSize, order, status });
         } catch (err) {
+          listError = err;
           lastError = err;
           strapi.log.error(
             `[kiteprop-sync] runReconcile list error on page ${page}: ${err.message}`
@@ -1726,6 +1797,35 @@ module.exports = ({ strapi: _strapi } = {}) => {
             new Error(`property ${id} failed during reconcile: ${failedItem.message || 'see logs'}`);
         }
       }
+
+      // FASE 3 — VISIBILITY: locals absent from KiteProp active set must stop
+      // showing on the website, but remain published Strapi documents. We only
+      // do this when the active scan is complete; otherwise a partial scan could
+      // hide valid properties.
+      const canReconcileInactiveLocals =
+        status === 'active' && !listError && !stoppedAtMaxPages && !stoppedAtMaxItems;
+
+      if (canReconcileInactiveLocals) {
+        const inactiveResult = await reconcileLocalsMissingFromActiveSet({
+          activeIds: seenIds,
+          ctx: { runId, dryRun, source },
+        });
+        inactive_candidates = inactiveResult.candidates;
+        items.push(...inactiveResult.items);
+        if (inactiveResult.error && !lastError) lastError = inactiveResult.error;
+      } else {
+        skippedInactiveReconcile = true;
+        await logger().record({
+          run_id: runId,
+          source,
+          resource: 'property',
+          action: 'reconcile_inactive',
+          status: 'noop',
+          message:
+            'skipped inactive local reconciliation because active scan was partial, capped, errored, or non-active status filter was used',
+          dry_run: dryRun,
+        });
+      }
     } catch (err) {
       lastError = err;
       strapi.log.error(`[kiteprop-sync] runReconcile error: ${err.message}`);
@@ -1744,6 +1844,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
     summary.max_items = maxItems;
     summary.stopped_at_max_pages = stoppedAtMaxPages;
     summary.stopped_at_max_items = stoppedAtMaxItems;
+    summary.inactive_candidates = inactive_candidates;
+    summary.skipped_inactive_reconcile = skippedInactiveReconcile;
     summary.dry_run = dryRun;
 
     await logger().record({
