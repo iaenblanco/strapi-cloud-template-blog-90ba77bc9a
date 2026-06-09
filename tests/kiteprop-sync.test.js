@@ -161,8 +161,13 @@ function installStrapiMock(options = {}) {
   }
 
   const propertyDocs = {
-    async findFirst({ filters } = {}) {
+    async findFirst({ filters, status } = {}) {
       const requestedKitepropId = filters?.kiteprop_id ? Number(filters.kiteprop_id) : null;
+      if (status === 'published') {
+        if (Object.prototype.hasOwnProperty.call(options, 'publishedLocalProperties')) {
+          return requestedKitepropId ? options.publishedLocalProperties?.[requestedKitepropId] || null : null;
+        }
+      }
       if (requestedKitepropId && options.localProperties?.[requestedKitepropId]) {
         return options.localProperties[requestedKitepropId];
       }
@@ -644,6 +649,38 @@ test('does not upload images when images_hash is unchanged', async () => {
   assert.equal(result.action, 'skip');
   assert.equal(calls.uploadCalls.length, 0);
   assert.equal(calls.propertyUpdates.length, 0);
+});
+
+test('publishes existing KiteProp draft even when data and images hashes are unchanged', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp = sampleProperty();
+  const { dataHash, imagesHash } = computedHashes(kp);
+  const calls = installStrapiMock({
+    existingProperty: {
+      documentId: 'prop-1',
+      Slug: mappers.buildKitepropSlug(kp.title, kp.id),
+      kiteprop_id: 101,
+      kiteprop_updated_at: kp.updated_at,
+      kiteprop_data_hash: dataHash,
+      kiteprop_images_hash: imagesHash,
+      Imagenes: [{ id: 11 }, { id: 12 }],
+      Publicado: true,
+    },
+    publishedLocalProperties: {},
+  });
+  const service = loadService();
+
+  const result = await service._internal.upsertProperty(kp, {
+    runId: 'run-test',
+    source: 'test',
+    dryRun: false,
+  });
+
+  assert.equal(result.action, 'update');
+  assert.equal(calls.propertyUpdates.length, 1);
+  assert.equal(calls.propertyUpdateStatuses[0], 'published');
+  assert.equal(calls.propertyUpdates[0].data.Publicado, true);
+  assert.equal(calls.propertyUnpublishes.length, 0);
 });
 
 test('reuses an existing image mapping by image_key', async () => {

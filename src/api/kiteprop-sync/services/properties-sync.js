@@ -110,6 +110,16 @@ module.exports = ({ strapi: _strapi } = {}) => {
     return found || null;
   }
 
+  async function findPublishedByKitepropId(kitepropId) {
+    if (!kitepropId) return null;
+    const found = await docs().findFirst({
+      filters: { kiteprop_id: Number(kitepropId) },
+      fields: ['id', 'documentId', 'kiteprop_id', 'Publicado'],
+      status: 'published',
+    });
+    return found || null;
+  }
+
   function isImageImportEnabled() {
     return String(process.env.KITEPROP_SYNC_IMPORT_IMAGES || 'true').toLowerCase() === 'true';
   }
@@ -395,14 +405,13 @@ module.exports = ({ strapi: _strapi } = {}) => {
     });
   }
 
-  async function findPublishedLocalKitepropProperties() {
+  async function findLocalKitepropProperties() {
     const rows = [];
 
     for (let offset = 0; ; offset += STRAPI_LOCAL_PAGE_SIZE) {
       const page = await strapi.db.query(PROPIEDAD_UID).findMany({
         where: {
           kiteprop_id: { $notNull: true },
-          Publicado: true,
         },
         select: ['id', 'documentId', 'kiteprop_id', 'kiteprop_status', 'Publicado'],
         limit: STRAPI_LOCAL_PAGE_SIZE,
@@ -416,7 +425,6 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
     const byDocument = new Map();
     for (const row of rows) {
-      if (row?.Publicado !== true) continue;
       const kitepropId = Number(row?.kiteprop_id);
       if (!Number.isFinite(kitepropId) || kitepropId <= 0) continue;
       const key = row?.documentId || String(row?.id || kitepropId);
@@ -428,8 +436,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
 
   async function reconcileLocalsMissingFromActiveSet({ activeIds, ctx }) {
     const startedAt = Date.now();
-    const localPublished = await findPublishedLocalKitepropProperties();
-    const missingFromActive = localPublished.filter((row) => !activeIds.has(Number(row.kiteprop_id)));
+    const localProperties = await findLocalKitepropProperties();
+    const missingFromActive = localProperties.filter((row) => !activeIds.has(Number(row.kiteprop_id)));
 
     await logger().record({
       run_id: ctx.runId,
@@ -438,7 +446,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
       action: 'reconcile_inactive',
       status: 'ok',
       message:
-        `found ${missingFromActive.length} local published KiteProp propert(ies) ` +
+        `found ${missingFromActive.length} local KiteProp propert(ies) ` +
         'absent from active set',
       dry_run: !!ctx.dryRun,
       duration_ms: Date.now() - startedAt,
@@ -519,6 +527,8 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const remoteDataHash = hashes.buildPropertyDataHash(payload);
     const remoteImagesHash = hashes.buildPropertyImagesHash(normalizedImages);
     const existing = await findByKitepropId(payload.kiteprop_id);
+    const publishedExisting = existing ? await findPublishedByKitepropId(payload.kiteprop_id) : null;
+    const needsPublishedWrite = !!existing && !publishedExisting?.documentId;
 
     result.kiteprop_id = payload.kiteprop_id;
     result.documentId = existing?.documentId;
@@ -542,6 +552,7 @@ module.exports = ({ strapi: _strapi } = {}) => {
     const dataChanged =
       !existing ||
       shouldWriteGeneratedSlug ||
+      needsPublishedWrite ||
       existing.kiteprop_data_hash !== remoteDataHash ||
       mappers.isRemoteNewer(payload.kiteprop_updated_at, existing.kiteprop_updated_at);
     const imageHashChanged = !existing || existing.kiteprop_images_hash !== remoteImagesHash;
