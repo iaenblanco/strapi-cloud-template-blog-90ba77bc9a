@@ -244,7 +244,9 @@ function mapPropertyToStrapi(kp) {
 
     Region: kp.state ?? null,
     Comuna: kp.city ?? null,
-    Ubicacion: kp.neighborhood ?? null,
+    // Ubicacion y Direccion provienen ambas de kp.address (decisión de negocio):
+    // queremos mostrar la dirección como ubicación. NO usamos kp.neighborhood.
+    Ubicacion: kp.address ?? null,
     Direccion: kp.address ?? null,
 
     Precio: precio,

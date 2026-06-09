@@ -2161,3 +2161,234 @@ test('mapping audit controller returns 500 when Strapi fails', async () => {
   assert.equal(ctx.body.ok, false);
   assert.equal(ctx.body.read_only, true);
 });
+
+// ---------------------------------------------------------------------------
+// Cambio de mapeo — Ubicacion / Direccion provienen de kp.address
+// ---------------------------------------------------------------------------
+
+test('mapper sets Ubicacion from kp.address (not from kp.neighborhood)', () => {
+  const payload = mappers.mapPropertyToStrapi(
+    sampleProperty({ address: 'Av Siempre Viva 742', neighborhood: 'Springfield' })
+  );
+
+  assert.equal(payload.Ubicacion, 'Av Siempre Viva 742');
+  // Confirmamos explícitamente que NO usa neighborhood.
+  assert.notEqual(payload.Ubicacion, 'Springfield');
+});
+
+test('mapper keeps Direccion from kp.address and equal to Ubicacion', () => {
+  const payload = mappers.mapPropertyToStrapi(
+    sampleProperty({ address: 'Av Siempre Viva 742', neighborhood: 'Springfield' })
+  );
+
+  assert.equal(payload.Direccion, 'Av Siempre Viva 742');
+  assert.equal(payload.Ubicacion, payload.Direccion);
+});
+
+// ---------------------------------------------------------------------------
+// Reconciliación completa / backfill — runReconcile
+// ---------------------------------------------------------------------------
+
+test('reconcile route is protected by has-trigger-token and auth false', () => {
+  const routes = require('../src/api/kiteprop-sync/routes/kiteprop-sync').routes;
+  const route = routes.find((item) => item.method === 'POST' && item.path === '/kiteprop-sync/properties/reconcile');
+
+  assert.ok(route);
+  assert.equal(route.handler, 'kiteprop-sync.reconcile');
+  assert.deepEqual(route.config.policies, ['api::kiteprop-sync.has-trigger-token']);
+  assert.equal(route.config.auth, false);
+});
+
+test('reconcile dryRun reports would-be changes but does not write, advance cursors, or deploy', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const kp = sampleProperty({ id: 101, address: 'Calle 1' });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 101 }],
+    properties: { 101: kp },
+    localProperties: { 101: localPropertyFromKiteProp(kp, { kiteprop_data_hash: 'old' }) },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-dry', dryRun: true, maxPages: 5, maxItems: 10 });
+
+  // Reporta que 1 propiedad cambiaría...
+  assert.equal(result.summary.updated, 1);
+  assert.equal(result.dry_run, true);
+  // ...pero NO escribe en Strapi, NO avanza cursores y NO deploya.
+  assert.equal(calls.propertyCreates.length, 0);
+  assert.equal(calls.propertyUpdates.length, 0);
+  assert.equal(calls.imageCreates.length, 0);
+  assert.equal(calls.imageUpdates.length, 0);
+  assert.equal(calls.bumpActivityCursor.length, 0);
+  assert.equal(calls.bumpMaxPropertyId.length, 0);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('reconcile real updates only properties with real differences', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp101 = sampleProperty({ id: 101, address: 'Calle 1' });
+  const kp102 = sampleProperty({ id: 102, address: 'Calle 2' });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 101 }, { id: 102 }],
+    properties: { 101: kp101, 102: kp102 },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101), // coincide -> skip
+      102: localPropertyFromKiteProp(kp102, { kiteprop_data_hash: 'old' }), // difiere -> update
+    },
+  });
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-real', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.created, 0);
+  assert.equal(result.summary.updated, 1);
+  assert.equal(result.summary.skipped, 1);
+  assert.equal(calls.propertyUpdates.length, 1);
+  assert.equal(calls.propertyCreates.length, 0);
+  // Solo la 102 (la que difería) se escribió en Strapi.
+  assert.equal(Number(calls.propertyUpdates[0].data.kiteprop_id), 102);
+  // No toca cursores de delta/sniffer.
+  assert.equal(calls.bumpActivityCursor.length, 0);
+  assert.equal(calls.bumpMaxPropertyId.length, 0);
+});
+
+test('reconcile real creates properties missing in Strapi', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const kp = sampleProperty({ id: 303, address: 'Calle Nueva' });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 303 }],
+    properties: { 303: kp },
+    // sin localProperties -> findFirst devuelve null -> create
+  });
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-create', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.created, 1);
+  assert.equal(calls.propertyCreates.length, 1);
+  assert.equal(Number(calls.propertyCreates[0].kiteprop_id), 303);
+});
+
+test('reconcile real triggers exactly one deploy at the end when there were changes', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const kp101 = sampleProperty({ id: 101, address: 'Calle 1' });
+  const kp102 = sampleProperty({ id: 102, address: 'Calle 2' });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 101 }, { id: 102 }],
+    properties: { 101: kp101, 102: kp102 },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101, { kiteprop_data_hash: 'old' }),
+      102: localPropertyFromKiteProp(kp102, { kiteprop_data_hash: 'old' }),
+    },
+  });
+  const deploySnapshots = [];
+  global.fetch = async () => {
+    deploySnapshots.push({ propertyUpdates: calls.propertyUpdates.length });
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-deploy', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.updated, 2);
+  // Un único deploy, disparado DESPUÉS de aplicar las 2 actualizaciones.
+  assert.equal(deploySnapshots.length, 1);
+  assert.equal(deploySnapshots[0].propertyUpdates, 2);
+});
+
+test('reconcile real does not deploy when there are no real differences', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const kp101 = sampleProperty({ id: 101, address: 'Calle 1' });
+  const kp102 = sampleProperty({ id: 102, address: 'Calle 2' });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 101 }, { id: 102 }],
+    properties: { 101: kp101, 102: kp102 },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101),
+      102: localPropertyFromKiteProp(kp102),
+    },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-nochange', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  assert.equal(result.summary.created, 0);
+  assert.equal(result.summary.updated, 0);
+  assert.equal(result.summary.skipped, 2);
+  assert.equal(calls.propertyUpdates.length, 0);
+  assert.equal(calls.propertyCreates.length, 0);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('reconcile deduplicates by kiteprop_id and respects maxItems', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  const calls = installStrapiMock({
+    propertyListPages: {
+      1: [{ id: 101 }, { id: 101 }, { id: 102 }],
+    },
+    properties: {
+      101: sampleProperty({ id: 101 }),
+      102: sampleProperty({ id: 102 }),
+    },
+  });
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-dedupe', dryRun: true, maxPages: 1, maxItems: 1 });
+
+  assert.equal(result.summary.properties_seen, 3);
+  assert.equal(result.summary.unique_candidates, 2);
+  assert.equal(result.summary.processed, 1);
+  assert.equal(result.summary.stopped_at_max_items, true);
+  // Sólo se consultó 1 propiedad en KiteProp (conservador con API calls).
+  assert.equal(calls.getProperty.length, 1);
+});
+
+test('reconcile keeps successful changes and leaves pending_deploy when a property fails', async () => {
+  process.env.KITEPROP_SYNC_IMPORT_IMAGES = 'false';
+  process.env.FRONTEND_DEPLOY_ENABLED = 'true';
+  process.env.FRONTEND_DEPLOY_HOOK_URL = 'https://hooks.example.com/secret';
+  const kp101 = sampleProperty({ id: 101, address: 'Calle 1' });
+  const calls = installStrapiMock({
+    propertyList: [{ id: 101 }, { id: 102 }],
+    properties: {
+      101: kp101,
+      102: new Error('KiteProp unavailable'),
+    },
+    localProperties: {
+      101: localPropertyFromKiteProp(kp101, { kiteprop_data_hash: 'old' }),
+    },
+  });
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return { ok: true, status: 200 };
+  };
+  const service = loadService();
+
+  const result = await service.runReconcile({ runId: 'rec-partial', dryRun: false, maxPages: 5, maxItems: 10 });
+
+  // 101 se actualizó OK; 102 falló de forma aislada (no aborta el resto).
+  assert.equal(result.summary.updated, 1);
+  assert.equal(result.summary.errors, 1);
+  assert.ok(result.error);
+  // El cambio exitoso NO se pierde y NO se deploya en el acto por el error...
+  assert.equal(fetchCalls.length, 0);
+  // ...queda pendiente para la próxima corrida segura.
+  assert.equal(lastStoreValue(calls, 'frontend_deploy_pending'), true);
+});

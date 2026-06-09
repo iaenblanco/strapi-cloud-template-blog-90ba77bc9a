@@ -71,6 +71,12 @@ module.exports = {
     },
     {
       method: 'POST',
+      path: '/kiteprop-sync/properties/reconcile',
+      handler: 'kiteprop-sync.reconcile',
+      config: { policies: policy, auth: false },
+    },
+    {
+      method: 'POST',
       path: '/kiteprop-sync/properties/:id',
       handler: 'kiteprop-sync.syncOne',
       config: { policies: policy, auth: false },
