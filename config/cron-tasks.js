@@ -5,6 +5,16 @@
  *
  * El backend/Strapi es la FUENTE PRINCIPAL de ejecución del sync (no GitHub Actions).
  *
+ * IMPORTANTE (Strapi Cloud): el cron NATIVO de Strapi no siempre se ejecuta en
+ * Strapi Cloud (se observó last_run_at congelado por más de una hora). Por eso
+ * la VÍA RECOMENDADA en producción es el AUTO-SYNC INTERNO
+ * (`api::kiteprop-sync.auto-sync`, activable con KITEPROP_AUTO_SYNC_ENABLED),
+ * que corre con un setInterval propio independiente de este cron.
+ *
+ * Este cron se mantiene por COMPATIBILIDAD y sigue funcionando igual. Si están
+ * activos a la vez (CRON_ENABLED + KITEPROP_AUTO_SYNC_ENABLED), el lock del
+ * sync-state evita la doble corrida y el auto-sync loguea una advertencia.
+ *
  * El cron se carga desde `config/server.js` solo cuando CRON_ENABLED=true.
  * Aun cargado, la tarea se AUTOPROTEGE con KITEPROP_SYNC_ENABLED para poder
  * arrancar en estado "registrado pero inactivo".
